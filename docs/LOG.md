@@ -1281,3 +1281,65 @@ plain TCP fallback, re-point the `--rpc` address if needed).
 Net: nothing left to build in software for issue #5. When the cable
 arrives, this should be "plug in, check one log line, maybe change one
 IP" rather than research from scratch.
+
+## Wiring the agent into launchd for real: node-b cutover, proven live
+
+Started the "one app" milestone -- replacing the hand-written per-role
+plists with `com.caravan.agent`, identical on every node, self-detecting
+head/tail. Found and fixed a real gap before touching anything live:
+`supervisor.py`'s `supervise()` had no signal handling. launchd stopping
+the agent (a plain `bootout` -- the routine operation this whole effort
+exists to make safe) would kill the Python process but leave its spawned
+`llama-server`/`rpc-server` child orphaned and still running, invisible
+to launchd, likely blocking the port on the next start. Fixed by
+catching `SIGTERM`/`SIGINT` and forwarding `terminate()` to the child
+before exiting, with a `SIGKILL` fallback. Verified synthetically first
+(a long-running child actually dies with the parent on `SIGTERM`,
+confirmed via `ps`; the normal crash-restart loop still restarts on
+schedule) before ever trusting it with launchd.
+
+Wrote `launchd/com.caravan.agent.plist` (Homebrew python3, matching the
+version note in `agent/README.md`). Real gotcha hit immediately: wrote
+and validated the plist locally but forgot to commit+push it before
+trying to use it on node-b -- `bootstrap` failed with a confusing
+"Input/output error" that looked like the known bootout/bootstrap race
+from earlier tonight, but was actually just a missing file. Worth
+remembering: that specific error message means more than one thing.
+
+Cutover plan (chose node-b/tail first -- lower blast radius than head):
+stop llama-server, swap node-b's `com.caravan.rpc-server` for
+`com.caravan.agent`, verify, restart llama-server, then a real crash
+test. All verified live:
+
+- Agent correctly self-detected tail role and spawned the exact
+  production command (`ggml-rpc-server -H 0.0.0.0 -p 50052 --cache`) --
+  confirmed via `ps -o pid,ppid` that the child's parent PID is the
+  agent's own PID, not launchd directly.
+- llama-server reconnected to it normally, full health.
+- **Crash test**: `kill -9`'d the agent-supervised `rpc-server` directly.
+  Agent noticed and respawned it ~13s later (matches the default
+  `restart_delay`), same agent PID throughout -- launchd's own
+  `KeepAlive` was never involved, proving the two-layer model works
+  (agent supervises its child; launchd supervises the agent itself).
+
+**Found something worth knowing while checking this, not from the
+cutover itself:** `/health` returning `ok` right after the kill did
+*not* mean llama-server's RPC connection was actually usable -- it was
+latently broken (a fresh `rpc-server` process is a different connection
+than the one llama-server still held a reference to), and `/health`
+only checks HTTP liveness, not RPC connectivity. Sent a real
+`/completion` request to check properly: got `ggml_abort` immediately,
+launchd's `KeepAlive` auto-recovered llama-server (same pattern as the
+original "self-inflicted crash" entry, confirming that failure mode is
+about *any* rpc-server restart, not specific to how it's triggered).
+After that recovery, a real `/completion` request returned a genuine
+`200 OK` with actual generated tokens -- confirmed fully working, not
+just superficially healthy. Lesson for future verification: after any
+rpc-server restart, check with a real inference request, not just
+`/health`.
+
+Node-b is now running under agent supervision, proven stable through a
+real crash-and-recover cycle. Node-a (head) cutover is the next step,
+deliberately sequenced after node-b per the original plan -- higher
+blast radius, since that's the node openclaw actually depends on being
+up.
