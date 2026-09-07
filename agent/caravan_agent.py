@@ -54,19 +54,35 @@ def is_agent_alive(ip: str, timeout: float = 1.5) -> bool:
         return False
 
 
-def discover_peers(agent_id: str) -> list[dict]:
+def discover_peers(agent_id: str, self_hostname: str | None = None) -> list[dict]:
     """Merges Tailscale + mDNS sightings into one peer list, preferring
     the Tailscale IP for a peer found both ways (see ARCHITECTURE.md),
     and keeping only peers that actually answer as a Caravan agent (see
     is_agent_alive above) -- a peer that's merely *reachable* isn't
     necessarily *ours*.
 
+    `self_hostname`: this node's own hostname, so its own mDNS
+    advertisement doesn't get discovered as if it were a peer -- a real
+    bug hit in testing (2026-09-07, see docs/LOG.md "mDNS fallback"):
+    once this agent started advertising itself (see main()), its own
+    `dns-sd -B` browse call found that same advertisement and the head
+    command tried to add itself as its own --rpc target. Tailscale's
+    `status --json` already excludes self by construction (its "Peer"
+    list never includes the local node), so this filter only matters for
+    the mDNS path.
+
     Reconciling an mDNS sighting with a Tailscale one by node identity
     isn't implemented yet -- this agent doesn't publish its own node_id
-    in an mDNS TXT record yet, so mDNS-found peers are reported as-is
-    (LAN IP only) and simply supplement, rather than get merged with,
-    Tailscale peers. Good enough for a first pass: on tonight's 2-node
-    LAN, a peer found via Tailscale is unambiguous already.
+    in an mDNS TXT record yet, so this dedupes by normalized hostname
+    (see _rpc_addrs_from_peers) rather than true node identity. Good
+    enough for today's 2-node LAN.
+
+    mDNS is not just supplemental info: as of 2026-09-07, Tailscale
+    discovery has a real known failure mode under launchd specifically
+    (the App-bundled CLI's IPC to the running GUI app fails from a
+    LaunchAgent context -- see docs/LOG.md, "Tailscale discovery fails
+    under launchd"), so mDNS is what actually makes head-role discovery
+    work in practice right now, not tailscale.get_peers().
     """
     peers = []
 
@@ -80,6 +96,8 @@ def discover_peers(agent_id: str) -> list[dict]:
         })
 
     for peer in mdns.discover_peers():
+        if self_hostname is not None and _normalize_hostname(peer.hostname) == _normalize_hostname(self_hostname):
+            continue
         if not is_agent_alive(peer.hostname):
             continue
         peers.append({
@@ -90,6 +108,34 @@ def discover_peers(agent_id: str) -> list[dict]:
         })
 
     return peers
+
+
+def _normalize_hostname(hostname: str) -> str:
+    """Best-effort node-identity match across sources: strips a trailing
+    ".local"/domain suffix and lowercases, so "prf-hays-exo02" (Tailscale)
+    and "prf-hays-exo02.local" (mDNS) are recognized as the same node.
+    Not true identity reconciliation (no shared node_id yet -- see
+    discover_peers) but good enough to avoid double-counting the same
+    peer as two --rpc targets when both sources find it.
+    """
+    return hostname.split(".")[0].lower()
+
+
+def _rpc_addrs_from_peers(peers: list[dict]) -> list[str]:
+    """Builds the --rpc address list, Tailscale preferred per
+    ARCHITECTURE.md, falling back to mDNS for any peer Tailscale didn't
+    find -- e.g. today's Tailscale-CLI-under-launchd failure (see
+    discover_peers's docstring), where Tailscale finds nothing at all and
+    mDNS is the only thing that makes sharding work. Always uses
+    config.RPC_PORT regardless of source; a peer dict's own "port" field
+    (when present) is that peer's *agent* health port, not its RPC port.
+    """
+    by_node: dict[str, dict] = {}
+    for p in peers:
+        key = _normalize_hostname(p["hostname"])
+        if key not in by_node or p["source"] == "tailscale":
+            by_node[key] = p
+    return [f"{p['ip']}:{config.RPC_PORT}" for p in by_node.values()]
 
 
 def main() -> int:
@@ -115,51 +161,65 @@ def main() -> int:
     print(f"[caravan-agent] health endpoint listening on :{config.AGENT_PORT}/health "
           "(so peers can verify this node, not just reach it)")
 
+    # Advertise so *other* nodes' mdns.discover_peers() can find this one --
+    # discover_peers() below only browses, it never advertised this node
+    # itself (a real gap: mDNS browsing found nothing on any node until
+    # this was added, since nothing was ever registered to find -- see
+    # docs/LOG.md, "mDNS fallback"). `advertiser` must be terminated on
+    # shutdown or dns-sd leaves this node's registration behind after the
+    # process exits (see mdns.advertise_start's docstring); the `finally`
+    # below covers both the --apply (supervise, blocks) and dry-run paths.
+    advertiser = mdns.advertise_start(me["hostname"], config.AGENT_PORT)
+    print(f"[caravan-agent] advertising via mDNS as {me['hostname']!r}")
+
     have_model = ollama_store.has_model(args.model)
     print(f"[caravan-agent] target model: {args.model} -- "
           f"{'present locally' if have_model else 'not present locally'}")
 
-    peers = discover_peers(me["node_id"])
+    peers = discover_peers(me["node_id"], self_hostname=me["hostname"])
     print(f"[caravan-agent] discovered {len(peers)} peer(s):")
     for p in peers:
         print(f"    {p['source']:9s} {p['hostname']:30s} {p['ip']}")
 
-    if have_model:
-        role = "head"
-        blob_path = ollama_store.resolve_blob_path(args.model)
-        if blob_path is None:
-            print(f"[caravan-agent] ERROR: manifest for {args.model} found but "
-                  "GGUF blob is missing -- cannot act as head.", file=sys.stderr)
-            return 1
+    try:
+        if have_model:
+            role = "head"
+            blob_path = ollama_store.resolve_blob_path(args.model)
+            if blob_path is None:
+                print(f"[caravan-agent] ERROR: manifest for {args.model} found but "
+                      "GGUF blob is missing -- cannot act as head.", file=sys.stderr)
+                return 1
 
-        rpc_addrs = [f"{p['ip']}:{config.RPC_PORT}" for p in peers if p["source"] == "tailscale"]
-        cmd = supervisor.build_head_command(str(blob_path), rpc_addrs)
-        print(f"[caravan-agent] role: HEAD for {args.model}")
-        print(f"[caravan-agent] would run: {' '.join(cmd)}")
+            rpc_addrs = _rpc_addrs_from_peers(peers)
+            cmd = supervisor.build_head_command(str(blob_path), rpc_addrs)
+            print(f"[caravan-agent] role: HEAD for {args.model}")
+            print(f"[caravan-agent] would run: {' '.join(cmd)}")
 
-        if args.apply:
-            log_path = config.STATE_DIR / "logs" / "llama-server.log"
-            print(f"[caravan-agent] --apply set, supervising now (log: {log_path})")
-            supervisor.supervise(cmd, log_path)
-    else:
-        role = "tail"
-        cmd = supervisor.build_tail_command()
-        print("[caravan-agent] role: TAIL (no local model -- ready to serve compute)")
-        print(f"[caravan-agent] would run: {' '.join(cmd)}")
+            if args.apply:
+                log_path = config.STATE_DIR / "logs" / "llama-server.log"
+                print(f"[caravan-agent] --apply set, supervising now (log: {log_path})")
+                supervisor.supervise(cmd, log_path)
+        else:
+            role = "tail"
+            cmd = supervisor.build_tail_command()
+            print("[caravan-agent] role: TAIL (no local model -- ready to serve compute)")
+            print(f"[caravan-agent] would run: {' '.join(cmd)}")
 
-        if args.apply:
-            log_path = config.STATE_DIR / "logs" / "rpc-server.log"
-            print(f"[caravan-agent] --apply set, supervising now (log: {log_path})")
-            supervisor.supervise(cmd, log_path)
+            if args.apply:
+                log_path = config.STATE_DIR / "logs" / "rpc-server.log"
+                print(f"[caravan-agent] --apply set, supervising now (log: {log_path})")
+                supervisor.supervise(cmd, log_path)
 
-    if not args.apply:
-        print("[caravan-agent] dry run -- pass --apply to actually spawn this.")
-        if args.serve_for > 0:
-            print(f"[caravan-agent] staying up for {args.serve_for:.0f}s "
-                  "so peers can discover this node...")
-            time.sleep(args.serve_for)
+        if not args.apply:
+            print("[caravan-agent] dry run -- pass --apply to actually spawn this.")
+            if args.serve_for > 0:
+                print(f"[caravan-agent] staying up for {args.serve_for:.0f}s "
+                      "so peers can discover this node...")
+                time.sleep(args.serve_for)
 
-    return 0
+        return 0
+    finally:
+        advertiser.terminate()
 
 
 if __name__ == "__main__":

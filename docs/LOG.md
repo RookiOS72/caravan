@@ -1406,3 +1406,61 @@ proven production config. The `agent/` head-role cutover is blocked on
 either fixing Tailscale CLI discovery under launchd, or adding an mDNS-
 only fallback path that doesn't need Tailscale for this specific
 2-node/same-LAN case -- not on anything else.
+
+## mDNS fallback for peer discovery -- implemented, dry-run verified, live verification still pending
+
+Researched installing a standalone `tailscaled` (the Homebrew formula)
+before touching anything: confirmed via Tailscale's own docs that Mac
+App Store + Standalone variants together is a hard, documented conflict
+(not just a caution) -- but what's installed here is the *Standalone*
+variant (`brew install --cask tailscale-app`), not App Store, so that
+specific conflict doesn't apply. Whether Standalone + the separate
+open-source `tailscaled` formula can coexist is genuinely unconfirmed by
+official docs either way. Given that real ambiguity, no urgent need
+(node-a was already safely reverted and working), and a real risk to
+the production `--rpc` path if wrong, chose the safer option: extend
+the agent's own mDNS discovery to work as a real fallback instead,
+zero new system-level installs.
+
+Two real bugs found and fixed along the way, in order:
+
+1. `caravan_agent.py`'s `_rpc_addrs_from_peers` (new) now builds --rpc
+   addresses from *any* discovered peer, Tailscale preferred, falling
+   back to mDNS -- previously hardcoded to Tailscale-only, silently
+   ignoring mDNS peers even though `discover_peers()` already found
+   them. Dedupes by a best-effort normalized hostname (strips `.local`,
+   lowercases) since there's no shared node_id across sources yet.
+2. Deeper bug, caught by actually dry-running the change rather than
+   trusting the diff: `mdns.advertise_start()` existed but was never
+   called anywhere -- the agent only ever *browsed* for mDNS peers, so
+   there was nothing to find regardless of fix #1. Added the missing
+   `advertise_start()` call to `main()`, with `advertiser.terminate()`
+   in a `finally` so a stopped agent doesn't leave a stale mDNS
+   registration behind. That surfaced a *third* bug immediately: once
+   node-a started advertising itself, its own `dns-sd -B` browse found
+   its own advertisement, and the head command tried to add itself as
+   its own `--rpc` target. Fixed with a `self_hostname` filter in
+   `discover_peers()`.
+
+**Verified**: dry run on node-a (no live launchd changes) now correctly
+excludes self, and produces the same correct production command as
+before when Tailscale succeeds (interactive shell -- Tailscale's CLI
+works fine there, only fails under launchd). **Not yet verified**: the
+actual case this was built for -- Tailscale failing under launchd
+*and* mDNS correctly stepping in as the real fallback -- since that
+needs a live agent cutover cycle on node-a, deliberately not attempted
+tonight (see below). Committed and pushed as "implemented, dry-run
+correct, live-path unverified" rather than overclaiming it's done.
+
+## Session pausing here -- stopping-point check
+
+User is pausing Caravan to switch to a different project (openclaw/exo
++ Rook's retro income-idea work) in a new session. Verified before
+handoff: git clean and pushed on both nodes, both live services healthy
+(node-a manual llama-server plist, node-b `com.caravan.agent`), GitHub
+issues reflect true state. Deliberately did *not* attempt node-a's live
+agent cutover under this time pressure -- that's real production risk,
+not something to rush before a context switch. Next session picking
+this back up should start with the live cutover test (mDNS-fallback
+path specifically), now that the code is believed correct but unproven
+live.
