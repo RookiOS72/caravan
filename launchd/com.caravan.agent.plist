@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.caravan.agent</string>
+
+    <key>Comment</key>
+    <string>Caravan: the self-organizing agent. Identical on every node -- each
+    instance decides for itself whether it's head or a tail and supervises
+    the appropriate local process (llama-server or rpc-server). Replaces
+    the per-role com.caravan.llama-server / com.caravan.rpc-server plists.
+    See docs/ARCHITECTURE.md. Requires Homebrew python3 (>=3.10, for the
+    `X | None` type syntax) -- the system /usr/bin/python3 is too old on
+    at least one node (3.9.6), see agent/README.md.</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/opt/homebrew/bin/python3</string>
+      <string>/Users/brenden/dev/caravan/agent/caravan_agent.py</string>
+      <string>--apply</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/brenden/dev/caravan/agent</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>25</integer>
+
+    <key>StandardInPath</key>
+    <string>/dev/null</string>
+    <key>StandardOutPath</key>
+    <string>/Users/brenden/Library/Logs/caravan/agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/brenden/Library/Logs/caravan/agent.log</string>
+  </dict>
+</plist>
