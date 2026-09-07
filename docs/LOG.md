@@ -1232,3 +1232,52 @@ the one real bug (the truncation), found and cut the one real waste
 (`browser` tool), found and merged the two safe redundancies. What's
 left is legitimate content, not something to keep hunting for savings
 in.
+
+## Issue #5 prep: confirmed the RDMA-over-Thunderbolt software stack is already fully ready
+
+Asked directly whether there's anything actionable before Thursday's
+USB4/Thunderbolt cable arrives, given issue #5 itself is otherwise
+blocked on the hardware. Worth checking rather than assuming there's
+nothing to do -- there was real prep work available.
+
+Traced `ggml-rpc.cpp`'s startup banner (`"transport: TCP (RDMA auto-
+negotiate enabled)"`, printed on every rpc-server/llama-server start
+tonight, easy to have skimmed past as decorative) back to
+`ggml/src/ggml-rpc/CMakeLists.txt`: on Apple, `GGML_RPC_RDMA` auto-
+enables at cmake-configure time if `librdma.dylib` is found, weakly
+linked (comment in the CMake file: "librdma.dylib only exists on macOS
+26.2 and later"). Both nodes run macOS 26.6.2. First check
+(`strings ~/dev/llama.cpp/build/bin/ggml-rpc-server`) found nothing --
+false negative, because `ggml-rpc` builds as its own dylib
+(`libggml-rpc.0.23.0.dylib`) that the thin `ggml-rpc-server`/
+`llama-server` executables just link against; the actual RDMA code
+lives there, not in the executables themselves. Checking the real
+library found the full RDMA(Apple/UC) string table (probe/activate/
+RTR/RTS/poll_cq error strings) on both nodes. Confirmed further with
+`vmmap` on the actual *running* processes (not just static analysis):
+`librdma.dylib` and, specifically, `libthunderboltrdma.dylib` are
+loaded live in both llama-server (node-a) and rpc-server (node-b) right
+now -- this isn't just compiled in, it's active in memory already.
+
+Also checked whether any macOS-level Thunderbolt networking setup is
+needed: both machines already have "EXO Thunderbolt 1/2/4" network
+services configured (pre-existing, from exo's own earlier Thunderbolt
+setup) -- nothing new to create there.
+
+**One real unknown, genuinely can't resolve without the hardware in
+hand:** read `transport-apple.cpp` to understand how RDMA activation is
+actually negotiated. `apple_rdma::probe()` takes the *existing bootstrap
+TCP socket* as its starting point -- RDMA negotiates over whatever
+connection `--rpc <ip>:<port>` already established, not a separate
+control channel. But RDMA device matching uses RoCEv2 IPv4-mapped GIDs
+keyed off "the local TCP address" (source comment) -- meaning it's
+unclear whether the current Tailscale-IP-based `--rpc` config will
+auto-upgrade once the cable's connected, or whether it needs to be
+re-pointed at whatever IP the Thunderbolt Bridge interface gets
+assigned. Not resolvable by reading source alone; a real 2-minute check
+once the cable's in (try as-is, check the log for "RDMA activated" vs.
+plain TCP fallback, re-point the `--rpc` address if needed).
+
+Net: nothing left to build in software for issue #5. When the cable
+arrives, this should be "plug in, check one log line, maybe change one
+IP" rather than research from scratch.
