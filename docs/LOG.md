@@ -1156,3 +1156,41 @@ rpc-server loaded from the repo path on node-b afterward.
 The remaining pieces of #7 (periodic GPU-memory polling, general
 system-resource monitoring) are small, well-scoped scripting work, not
 urgent -- left as a future addition rather than built tonight.
+
+## Everything converges into one app -- and the scaffold had drifted from tonight's production config
+
+Asked directly: won't the proxy, the restart-coordination logic, and
+monitoring all eventually be part of the single unified `agent/` app
+rather than staying separate scripts? Yes -- that's `ARCHITECTURE.md`'s
+own stated goal ("One app... installed identically on every machine"),
+just not written down explicitly enough. Added a "Scope: what 'one app'
+actually covers" section to `ARCHITECTURE.md` naming all four pieces
+(process supervision, the proxy, cross-node restart coordination,
+monitoring) as things that converge into the agent, not stay standalone.
+
+While there, found and fixed a real gap: `agent/supervisor.py`'s
+`build_head_command()`/`build_tail_command()` didn't reflect *any* of
+tonight's hard-won production config. Had the agent been run with
+`--apply` as-is, it would have silently reproduced the exact
+`kv_unified=true` shared-pool problem and 16K-per-slot truncation risk
+fixed earlier tonight -- no `--parallel`, no `--no-kv-unified`, no
+`--slot-save-path`, a flat `-c 65536` instead of `n_slots * ctx_per_slot`,
+and no `--cache` on the tail side at all (the exact flag that just gave
+an 8-9x restart speedup). Fixed both functions and added the missing
+config (`LLAMA_SERVER_N_SLOTS`, `LLAMA_SERVER_CTX_PER_SLOT`,
+`SLOT_SAVE_DIR`, `RPC_SERVER_USE_CACHE`) to `agent/config.py`. Verified
+via a real dry run: `caravan_agent.py`'s printed head command now
+matches the live production `llama-server` invocation exactly (`-c
+262144 --slot-save-path ... --parallel 4 --no-kv-unified`), and
+`build_tail_command()` now includes `--cache`.
+
+Also corrected `ARCHITECTURE.md`'s Phase 2 description, which still said
+shard caching needed "a real patch to `ggml-rpc.cpp`" -- stale as of
+issue #3's native fix earlier tonight. Phase 2 is now mostly done; what's
+left is exactly the `--cache` wiring just fixed above, not new
+engineering. Updated the GitHub-issues cross-reference section to match
+current reality (#1 and #3 both closed, #7 open but scoped down).
+
+Monitoring itself (the actual GET_DEVICE_MEMORY polling / vm_stat
+extension to `health_server.py`) is still the next concrete step --
+scope agreed, not yet built.

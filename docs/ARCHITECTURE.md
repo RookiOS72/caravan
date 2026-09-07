@@ -101,6 +101,34 @@ llama.cpp's own RPC protocol handles the actual tensor transfer.
 "Cache it for next time" (a tail persisting its assigned tensor range
 across restarts) is **not** part of this phase — see Phase 2 below.
 
+## Scope: what "one app" actually covers
+
+Not just process spawning. Everything that's currently a separate,
+manually-managed piece is in scope to eventually be absorbed into this
+one agent, not left standing alongside it forever:
+
+- **Process supervision** (Phase 1, below) -- replaces the hand-written
+  launchd plists.
+- **The slot-pinning reverse proxy** (`../proxy/slot_pin_proxy.py`) --
+  currently a third, separately-supervised process. Not yet folded in;
+  real open question is whether it becomes a component the agent runs
+  itself, or stays a standalone piece the agent merely launches/monitors.
+  Not decided -- see Open Questions.
+- **Cross-node restart coordination** -- `../scripts/restart-rpc-server.sh`
+  encodes the safe restart order (stop head, restart tail, start head)
+  as a manual/scripted operator action today. Once agents run on both
+  nodes with a real health/status surface between them, this becomes
+  something the agents negotiate directly (a tail can tell its head "I'm
+  about to restart" and get a clean pause instead of a crash) rather
+  than a human running a script. See GitHub issue #7.
+- **Monitoring/heartbeat** -- `health_server.py`'s `/health` endpoint
+  today only answers "is this node a live Caravan agent" (for discovery
+  gating). Growing it into real liveness + resource reporting (CPU,
+  memory, and GPU memory via `ggml-rpc`'s existing `RPC_CMD_GET_DEVICE_MEMORY`)
+  is the natural, single place this lives -- not a separate monitoring
+  script -- since this endpoint already exists and already runs on every
+  node.
+
 ## Two build phases
 
 **Phase 1 — orchestration/robustness layer (building now).** Discovery,
@@ -111,18 +139,17 @@ absorbs GitHub issue #1 (manual launchd supervision) — once the agent
 exists, hand-maintained per-role plists go away entirely rather than
 getting a standalone fix first.
 
-**Phase 2 — shard cache.** A real patch to `ggml-rpc.cpp` so a tail can
-persist and reuse its assigned tensor range across restarts, instead of
-re-streaming the full shard over the network every time (currently
-5-7+ minutes over WiFi — see LOG.md). This is genuinely committed, not a
-maybe: it's a real robustness/speed improvement independent of any
-hardware change. It's sequenced *second*, not deprioritized — a patch to
-`rpc-server`'s wire protocol should land on top of an orchestration layer
-that's already proven stable, not on top of today's manually-launched
-moving target. (An incoming USB4/Thunderbolt link between the two Macs
-will separately speed up shard transfer — that's a nice bonus, explicitly
-not a substitute for this phase. See LOG.md for that discussion.)
-Corresponds to GitHub issue #3, reframed.
+**Phase 2 — shard cache.** ~~A real patch to `ggml-rpc.cpp`~~ **Done
+already, turned out to need no patch at all** (2026-09-06, later still:
+see LOG.md, "Issue #3: solved natively"). `ggml-rpc.cpp` already ships a
+hash-keyed, self-invalidating on-disk tensor cache; `rpc-server --cache`
+turns it on. Verified live: 53s warm-cache restart vs. 7-11 minutes cold.
+What's left for Phase 2 isn't a C++ patch, just making sure the agent
+actually passes `--cache` when it spawns `rpc-server` (`supervisor.py`
+doesn't yet — see LOG.md's "single unified app" entry). (An incoming
+USB4/Thunderbolt link between the two Macs will separately speed up the
+*cold*-cache/first-ever transfer — a nice bonus, not a substitute for
+this.) Corresponds to GitHub issue #3, now closed.
 
 ## Language
 
@@ -165,17 +192,25 @@ eventual compiled/dependency-free goal either.
   message (today this is implicit in how `llama-server --rpc` connects
   out; whether the agent needs its own explicit message on top of that,
   or whether "tail has `rpc-server` reachable" is sufficient, is unresolved).
-- What health-check surface each agent exposes for peer liveness checks
-  (used by both the mDNS and Tailscale discovery paths).
-- Whether a standalone stopgap fix for issue #1 (bootstrapping
-  `llama-server` under launchd manually, using tonight's Tailscale-IP fix)
-  is still worth doing before Phase 1 lands, or whether it's fine to wait
-  for Phase 1 to fully absorb it.
+- Whether the slot-pinning proxy becomes a component the agent runs
+  itself, or stays a standalone piece the agent merely launches/monitors
+  (see "Scope: what 'one app' actually covers," above).
+- Exact protocol for cross-node restart coordination (a tail telling its
+  head "restarting, please pause" before it goes down) — GitHub issue #7
+  scoped this down considerably once issue #3 made recovery cheap (~50s),
+  so this is lower urgency than it was, but still undecided.
 
 ## Relationship to existing GitHub issues
 
-- **#1** (supervise processes with launchd) — absorbed by Phase 1; not
-  closed yet pending the open question above.
+- **#1** (supervise processes with launchd) — closed
+  (2026-09-06, crash-recovery verified live). Phase 1 still absorbs the
+  *manual per-role plist* problem this leaves behind; #1 itself was
+  narrower (does it survive a crash/reboot) and that part is done.
 - **#2** (system prompt size) — unrelated, still open on its own track.
-- **#3** (shard-scoped cache) — becomes Phase 2 above; issue stays open
-  as the tracking issue, reframed by this doc rather than superseded.
+- **#3** (shard-scoped cache) — closed (2026-09-06, solved natively via
+  `rpc-server --cache`, no patch needed — see Phase 2 above). What
+  remains for the agent is wiring the flag in, not building the feature.
+- **#7** (node-to-node lifecycle signaling) — open; two of its three
+  proposed signals turned out to already be covered by existing
+  mechanisms (see LOG.md), the remaining monitoring/coordination piece
+  is this doc's "Scope" section above, not separate work.

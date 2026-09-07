@@ -17,8 +17,19 @@ import config
 
 def build_head_command(model_blob_path: str, peer_rpc_addrs: list[str]) -> list[str]:
     """`peer_rpc_addrs` like ["100.90.134.95:50052"] -- Tailscale IPs
-    preferred, per discovery.py and tonight's EHOSTUNREACH findings."""
+    preferred, per discovery.py and tonight's EHOSTUNREACH findings.
+
+    Flags below match the production config proven live on 2026-09-06
+    (docs/LOG.md: "kv_unified=false", "Raising -c to 262144", "Issue #4"):
+    --parallel is required for --no-kv-unified to actually take effect
+    (server.cpp silently forces kv_unified=true on the n_parallel<0 auto
+    path otherwise -- see LOG.md, "no-kv-unified alone was silently
+    ignored"), and -c must be n_slots * ctx_per_slot, not a flat
+    ctx-per-slot value, or every slot silently gets a much smaller window
+    than intended.
+    """
     tensor_split = ",".join("1" for _ in range(len(peer_rpc_addrs) + 1))
+    total_ctx = config.LLAMA_SERVER_N_SLOTS * config.LLAMA_SERVER_CTX_PER_SLOT
     cmd = [
         str(config.LLAMA_SERVER_BIN),
         "-m", model_blob_path,
@@ -34,17 +45,27 @@ def build_head_command(model_blob_path: str, peer_rpc_addrs: list[str]) -> list[
     cmd += [
         "--tensor-split", tensor_split,
         "--port", str(config.LLAMA_SERVER_PORT),
-        "-c", str(config.LLAMA_SERVER_CTX_SIZE),
+        "-c", str(total_ctx),
+        "--slot-save-path", str(config.SLOT_SAVE_DIR) + "/",
+        "--parallel", str(config.LLAMA_SERVER_N_SLOTS),
+        "--no-kv-unified",
     ]
     return cmd
 
 
 def build_tail_command() -> list[str]:
-    return [
+    """--cache (GitHub issue #3, "solved natively") turns a restart from
+    a 7-11 minute full re-transfer into a ~50-60s warm-cache load -- see
+    docs/LOG.md. Only reason to ever pass RPC_SERVER_USE_CACHE=False is
+    disk space on a node too small to hold a cached copy of its shard."""
+    cmd = [
         str(config.RPC_SERVER_BIN),
         "-H", "0.0.0.0",
         "-p", str(config.RPC_PORT),
     ]
+    if config.RPC_SERVER_USE_CACHE:
+        cmd += ["--cache"]
+    return cmd
 
 
 def supervise(cmd: list[str], log_path, restart_delay: float = 10.0):
