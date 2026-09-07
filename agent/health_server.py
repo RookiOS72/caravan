@@ -12,6 +12,12 @@ interfaces since peers need to reach it -- LAN/tailnet-only by design,
 same posture as rpc-server itself, see launchd/README.md's security
 note).
 
+Also carries this node's own resource stats (load average, memory
+pressure, relevant disk headroom -- see system_stats.py) alongside the
+liveness check. One endpoint doing both rather than a second one,
+since anything polling for "is this peer alive" benefits from getting
+"and how loaded is it" in the same round trip for free.
+
 2026-09-06: first real cross-node test (see docs/LOG.md) found this
 hanging for ~35s on startup on node-b specifically. Root cause:
 `http.server.HTTPServer.server_bind()` calls `socket.getfqdn(host)` to
@@ -28,6 +34,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
+import system_stats
 
 
 class _Server(ThreadingHTTPServer):
@@ -50,7 +57,15 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        body = json.dumps({"status": "ok", "node_id": self.node_id}).encode()
+        try:
+            stats = system_stats.gather([config.SLOT_SAVE_DIR, config.RPC_CACHE_DIR])
+        except Exception as exc:  # noqa: BLE001 -- stats are a bonus, never fail liveness over them
+            stats = {"error": str(exc)}
+        body = json.dumps({
+            "status": "ok",
+            "node_id": self.node_id,
+            "stats": stats,
+        }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

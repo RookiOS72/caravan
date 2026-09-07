@@ -47,6 +47,13 @@ SLOT_SAVE_DIR = Path.home() / ".caravan" / "llama-server" / "slots"
 # Caravan built -- see docs/LOG.md, "Issue #3: solved natively."
 RPC_SERVER_USE_CACHE = True
 
+# Where rpc-server --cache actually writes -- matches
+# fs_get_cache_directory() in tools/rpc/rpc-server.cpp's macOS branch.
+# Only meaningful on a tail node; a head node won't have this directory.
+# Used by system_stats.py to report disk headroom, not by supervisor.py
+# (the C++ binary derives this path itself from --cache, nothing to pass).
+RPC_CACHE_DIR = Path.home() / "Library" / "Caches" / "llama.cpp" / "rpc"
+
 # mDNS/Bonjour service type this agent advertises and browses for.
 MDNS_SERVICE_TYPE = "_caravan._tcp"
 MDNS_DOMAIN = "local"
