@@ -9,6 +9,7 @@ caravan_agent.py is explicitly told to (--apply). Scaffold stage --
 proven correct in caravan_agent.py's dry-run output before this actually
 drives the live setup.
 """
+import signal
 import subprocess
 import time
 
@@ -68,7 +69,8 @@ def build_tail_command() -> list[str]:
     return cmd
 
 
-def supervise(cmd: list[str], log_path, restart_delay: float = 10.0):
+def supervise(cmd: list[str], log_path, restart_delay: float = 10.0,
+              stop_timeout: float = 15.0):
     """Runs `cmd`, restarting it if it exits, forever. Blocking -- run in
     its own thread/process. `log_path`: where stdout+stderr go (append
     mode), matching the launchd plists' StandardOutPath/StandardErrorPath
@@ -78,10 +80,38 @@ def supervise(cmd: list[str], log_path, restart_delay: float = 10.0):
     `restart_delay`, no health checking beyond "did the process exit".
     Good enough to replace launchd's KeepAlive for phase 1; a smarter
     policy can come later if a real crash-loop shows up in practice.
+
+    Handles SIGTERM/SIGINT explicitly and forwards them to the child --
+    without this, launchd stopping *this* process (e.g. a plain
+    `bootout`, the routine operation this whole thing exists to make
+    safe) would kill the agent but leave `cmd`'s process orphaned and
+    still running, invisible to launchd and likely blocking the port on
+    next start. `stop_timeout` should stay comfortably under the plist's
+    own `ExitTimeOut` so the graceful path has time to finish before
+    launchd SIGKILLs the whole process group itself.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    while True:
+    stopping = False
+
+    def _request_stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+
+    while not stopping:
         with open(log_path, "a") as log_file:
             proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-            proc.wait()
+            while proc.poll() is None and not stopping:
+                time.sleep(0.5)
+            if stopping and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=stop_timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        if stopping:
+            break
         time.sleep(restart_delay)
