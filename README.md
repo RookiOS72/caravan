@@ -57,12 +57,23 @@ launchctl bootout gui/$(id -u)/com.caravan.llama-server
 launchctl bootstrap gui/$(id -u) ~/dev/caravan/launchd/com.caravan.llama-server.plist
 ```
 
-Restarting `llama-server` triggers a full model reload — currently
-**~7-11 minutes** (WiFi-bound shard transfer to node-b; see
-[docs/LOG.md](docs/LOG.md)), so avoid it mid-conversation when possible.
-**Never restart node-b's `rpc-server` while `llama-server` is loading** —
-doing so mid-transfer corrupts the in-flight load (see docs/LOG.md).
-Check `curl http://127.0.0.1:8080/slots` shows everything idle first.
+Restarting `llama-server` triggers a full model reload. node-b's
+`rpc-server` runs with `--cache` (a native llama.cpp feature — see
+docs/LOG.md, "Issue #3: solved natively"), so as long as node-b's disk
+cache is already warm this is now **~50-60 seconds**, not the
+**~7-11 minutes** it takes cold (first run ever, or after a model/split
+change that invalidates the cache; WiFi-bound shard transfer to node-b).
+Either way, avoid it mid-conversation when possible.
+
+**Never restart node-b's `rpc-server` while `llama-server` is running at
+all** — not just "mid-transfer": `rpc-server` is stateless and holds
+node-b's half of the model only in that process's own RAM, and
+`llama-server` keeps a live RPC session against it for its entire
+runtime, so restarting `rpc-server` at any point severs that connection
+and crashes `llama-server` (see docs/LOG.md, "Self-inflicted crash").
+Stop `llama-server` first, then restart `rpc-server`, then start
+`llama-server` again. Check `curl http://127.0.0.1:8080/slots` shows
+everything idle before stopping anything.
 
 ### Stop
 

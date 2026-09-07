@@ -1066,3 +1066,52 @@ shrinking cold-start cost. The remaining lever is trimming `AGENTS.md`'s
 actual content -- real policy the user wrote, not something to cut
 without them reviewing it, so left as an open, user-owned option rather
 than done tonight.
+
+## Issue #3: solved natively -- `rpc-server --cache`, no C++ patch needed
+
+Originally scoped this as a multi-hour feature requiring a patch to
+`ggml-rpc.cpp` (a hash-keyed on-disk tensor cache, checked before
+accepting a network transfer). Wrong -- should have checked upstream
+source before concluding that. It already exists, built into mainline
+llama.cpp:
+
+- Every `SET_TENSOR` over 10MB (`HASH_THRESHOLD`) triggers the client
+  (llama-server, always, unconditionally -- no client-side flag) to try
+  `RPC_CMD_SET_TENSOR_HASH` first: send just an FNV hash of the tensor's
+  actual content.
+- `rpc-server`'s `-c`/`--cache` flag makes the *tail* persist tensor
+  content to `~/Library/Caches/llama.cpp/rpc/<hash>` (any content > 10MB)
+  and check that cache on every future hash-first request. A hit
+  (`response.result = 1`) skips the actual data transfer entirely and
+  loads from local disk instead; a miss falls straight back to a normal
+  full transfer, so it degrades cleanly with zero coordination needed
+  between head and tail versions/config.
+- Self-invalidating by construction -- keyed on real tensor content, not
+  a filename or version string, so a changed model file just produces a
+  cache miss and a normal (slow) fallback, never stale data silently
+  served.
+
+Implementation was a one-line plist change on node-b
+(`com.caravan.rpc-server.plist`, add `--cache`) plus the same corrected
+restart sequence from earlier tonight (stop llama-server first, since it
+holds a live RPC session against rpc-server; only then bootout/bootstrap
+rpc-server; then start llama-server again). Verified live, twice:
+
+- First reload after enabling `--cache` (cache empty, has to populate):
+  7m23s -- normal, matches the historical baseline, as expected for a
+  cold cache.
+- Confirmed the cache actually populated: `~/Library/Caches/llama.cpp/rpc/`
+  on node-b, 151 files, 7.6GB, matching node-b's assigned half of the
+  model.
+- Second reload immediately after (same model, same tensor-split, cache
+  warm): **53 seconds**, confirmed via node-a's own log timestamps
+  (`model loaded` / `listening` at 0:50.5 elapsed) matching the observed
+  wall-clock time. Roughly an 8-9x speedup over the 7-11 minute baseline
+  that held all night.
+
+This is the second time tonight a "sounds like real engineering work"
+problem turned out to already be solved upstream (issue #4's slot
+save/restore was the first). Should have checked `rpc-server --help`
+before scoping this as a C++ patch in the first place -- prefer native,
+built-in levers over custom builds, and check for them before estimating
+effort, not after.
