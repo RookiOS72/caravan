@@ -72,8 +72,18 @@ node-b's half of the model only in that process's own RAM, and
 runtime, so restarting `rpc-server` at any point severs that connection
 and crashes `llama-server` (see docs/LOG.md, "Self-inflicted crash").
 Stop `llama-server` first, then restart `rpc-server`, then start
-`llama-server` again. Check `curl http://127.0.0.1:8080/slots` shows
-everything idle before stopping anything.
+`llama-server` again — or just use the script that does this in the
+right order automatically:
+
+```sh
+./scripts/restart-rpc-server.sh
+```
+
+It checks `/slots` is idle first (refuses to run unless you pass
+`--force`), does the three-step sequence, and waits for `/health` to
+report ready. Reaches for `ssh brenden@192.168.1.39` by default —
+override with `CARAVAN_NODE_B_HOST`/`CARAVAN_NODE_B_USER` env vars if
+node-b's address ever changes.
 
 ### Stop
 

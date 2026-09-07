@@ -1115,3 +1115,44 @@ save/restore was the first). Should have checked `rpc-server --help`
 before scoping this as a C++ patch in the first place -- prefer native,
 built-in levers over custom builds, and check for them before estimating
 effort, not after.
+
+## Issue #7: checked for native levers first, scoped down, shipped the small piece
+
+Applied the same "check before building" discipline to issue #7's three
+proposed signals before writing anything:
+
+- **Ready/loaded** -- already covered. The RPC `HELLO` handshake plus
+  llama-server's own `/health` endpoint already give this at the
+  application layer. Nothing to build.
+- **Heartbeat/resource stats** -- partially already there.
+  `ggml-rpc.cpp` has a real `RPC_CMD_GET_DEVICE_MEMORY` command (checked
+  the source: `rpc_server::get_device_memory`, used today only once at
+  startup by `common/fit.cpp` for capacity planning, never polled
+  periodically). A small script polling it on a timer would give live
+  GPU-memory monitoring with zero llama.cpp changes. Doesn't cover CPU
+  load or temperature, though -- `ggml-rpc` has no concept of those at
+  all (a tensor-compute backend, not a system monitor); that part would
+  need a separate small script wrapping macOS's own tools (`vm_stat`,
+  `powermetrics`), not new protocol work.
+- **Shutdown notice** -- confirmed genuinely missing (no `SIGTERM`
+  handler anywhere in `rpc-server.cpp`/`ggml-rpc.cpp`), but issue #3's
+  `--cache` fix changed the cost math: recovery from the resulting crash
+  used to mean a 7-11 minute reload, now it's ~50s warm. The crash itself
+  is cheap to recover from now, so a protocol-level graceful-shutdown
+  handshake isn't worth building yet -- the practical fix is just
+  sequencing the existing restart correctly.
+
+Shipped that last piece: `scripts/restart-rpc-server.sh` -- checks
+`/slots` is idle (refuses without `--force`), stops llama-server, waits
+for it to actually exit, restarts rpc-server via SSH from the repo path,
+starts llama-server again, polls `/health` until ready. Deliberately
+outside `agent/` -- that's the separate, bigger self-organizing-agent
+initiative (still a scaffold, not wired into launchd); this is a small,
+immediate tool for the launchd setup actually running today. Ran it for
+real: 34 seconds end-to-end, even faster than the manual 53s test
+earlier tonight. Verified `/health` ok, all 4 slots at `n_ctx: 65536`,
+rpc-server loaded from the repo path on node-b afterward.
+
+The remaining pieces of #7 (periodic GPU-memory polling, general
+system-resource monitoring) are small, well-scoped scripting work, not
+urgent -- left as a future addition rather than built tonight.
