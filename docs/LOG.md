@@ -1343,3 +1343,66 @@ real crash-and-recover cycle. Node-a (head) cutover is the next step,
 deliberately sequenced after node-b per the original plan -- higher
 blast radius, since that's the node openclaw actually depends on being
 up.
+
+## Node-a agent cutover: Tailscale discovery fails under launchd, reverted to the manual plist
+
+Cut node-a over the same way as node-b (stop llama-server, bootout the
+manual plist, bootstrap `com.caravan.agent`). It came up and correctly
+self-detected HEAD role -- but the spawned command had no `--rpc`/
+`--device` at all (`--tensor-split 1`, single value): zero peers
+discovered, meaning it silently ran single-node instead of sharded
+across node-b. A real functional regression, not cosmetic -- caught
+before treating the cutover as done, by actually reading the spawned
+command rather than just checking `/health`.
+
+Diagnosed methodically rather than guessing: `agent.log` was empty even
+with real content to show (found and fixed a related but separate bug:
+Python's stdout is fully buffered when not a TTY, same class of issue as
+tonight's earlier rpc-server buffering mystery -- added `-u` to the
+plist's `ProgramArguments` for unbuffered agent output). With logging
+actually working, both `tailscale.get_peers()` and
+`caravan_agent.is_agent_alive()` were tested in isolation first and both
+succeeded from an interactive shell -- yet the real agent, run for real
+under launchd, reproducibly found 0 peers (twice). Added temporary debug
+logging to `tailscale.py`'s exception handler rather than keep guessing,
+redeployed, and got the real answer immediately: `tailscale status
+--json` returns exit code 0 but stdout `"The Tailscale GUI failed to
+start: The operation couldn't be completed. (Tailscale.CLIError error
+3.)"` -- not JSON at all, hence the `JSONDecodeError` that was silently
+swallowed into "0 peers."
+
+Root cause: `/Applications/Tailscale.app`'s bundled CLI binary isn't a
+standalone client -- its `status --json` shim talks to the already-
+running Tailscale.app GUI process over local IPC. That works fine from
+an interactive shell (the GUI app is reachable in that session context)
+but fails specifically from a launchd LaunchAgent -- another instance of
+tonight's recurring theme (see ARCHITECTURE.md's EHOSTUNREACH note) that
+this Mac's process context measurably affects network/IPC behavior in
+ways not fully understood. Checked for a fix: a standalone
+`tailscaled`-based CLI exists as a separate Homebrew formula
+(`brew install tailscale`), but it's not installed -- only the GUI cask
+is. Installing it would mean running a second Tailscale client/daemon
+alongside the existing GUI app, a real infrastructure change (possible
+conflict with the connection that's been working reliably all night,
+needs root via `brew services`) -- not something to do unilaterally
+mid-cutover. Left unfixed for now, flagged as a real follow-up.
+
+**Reverted node-a to the manual `com.caravan.llama-server` plist**
+rather than leave it running degraded. Verified restored: real `--rpc
+100.90.134.95:50052 --device MTL0,RPC0 --tensor-split 1,1` command,
+warm-cache reload, and confirmed with an actual `/completion` request
+(not just `/health`, per the lesson from node-b's crash test above) --
+`200 OK`, all 4 slots at `n_ctx: 65536`.
+
+Cleaned up the temporary debug prints into permanent, properly-labeled
+diagnostic logging (not removed entirely -- this exact failure mode
+would be equally hard to diagnose next time without them) rather than
+leaving throwaway `DEBUG` output in place.
+
+**Current state**: node-b runs under agent supervision (tail role
+doesn't depend on peer discovery at all, unaffected by this bug,
+verified stable). node-a is back on the manual plist, running the
+proven production config. The `agent/` head-role cutover is blocked on
+either fixing Tailscale CLI discovery under launchd, or adding an mDNS-
+only fallback path that doesn't need Tailscale for this specific
+2-node/same-LAN case -- not on anything else.

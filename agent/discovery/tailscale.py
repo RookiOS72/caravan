@@ -64,7 +64,19 @@ def get_peers(timeout: float = 5.0) -> list[TailscalePeer]:
             check=True,
         )
         data = json.loads(result.stdout)
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as exc:
+        # Logged, not silent: this exact path has a real known failure mode
+        # under launchd specifically -- the GUI-app-bundled `tailscale`
+        # binary's CLI shim talks to the running Tailscale.app over local
+        # IPC, which can fail from a launchd LaunchAgent context even
+        # though the same command works fine from an interactive shell
+        # (confirmed 2026-09-07: `Tailscale.CLIError error 3` on stdout,
+        # exit code 0, empty JSON -- see docs/LOG.md, "node-a agent
+        # cutover: Tailscale discovery fails under launchd"). Not fixed
+        # here; this is a discovery-source failure, not a crash -- the
+        # caller falls back to whatever mDNS finds, or single-node.
+        print(f"[caravan-agent] tailscale.get_peers() failed ({exc!r}) -- "
+              "falling back to mDNS/single-node")
         return []
 
     peers = []

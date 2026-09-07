@@ -17,6 +17,7 @@
     <key>ProgramArguments</key>
     <array>
       <string>/opt/homebrew/bin/python3</string>
+      <string>-u</string>
       <string>/Users/brenden/dev/caravan/agent/caravan_agent.py</string>
       <string>--apply</string>
     </array>

@@ -49,7 +49,8 @@ def is_agent_alive(ip: str, timeout: float = 1.5) -> bool:
         ok = resp.status == 200
         conn.close()
         return ok
-    except OSError:
+    except OSError as exc:
+        print(f"[caravan-agent] is_agent_alive({ip!r}) failed: {exc!r}")
         return False
 
 
