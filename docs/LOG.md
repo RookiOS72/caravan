@@ -1194,3 +1194,41 @@ current reality (#1 and #3 both closed, #7 open but scoped down).
 Monitoring itself (the actual GET_DEVICE_MEMORY polling / vm_stat
 extension to `health_server.py`) is still the next concrete step --
 scope agreed, not yet built.
+
+(Monitoring shipped shortly after this entry -- see "agent: add
+resource-stats monitoring to /health" below.)
+
+## Issue #2, closed out: the last two safe AGENTS.md trims
+
+Went through the full, now-untruncated `AGENTS.md` looking for anything
+genuinely cuttable -- not a values call, just redundancy. Found two:
+
+1. A leftover TOOLS.md-migration block that was a *template example*
+   (placeholder camera names, a placeholder SSH host, a placeholder TTS
+   voice) rather than real configured content -- trimmed to a one-line
+   pointer, kept the "why kept separate from skills" rationale.
+2. Two sections covering the exact same rule and the same real incident
+   ("Large Deliverables" and "Large or Multi-Item Deliverables"),
+   apparently from two authoring passes that never got merged. Combined
+   into one section, keeping the full recipe, the explicit
+   never-placeholder rule, and the real incident narrative -- nothing
+   lost, just said once instead of twice.
+
+Set honest expectations before doing this: these are real but small --
+estimated ~3-5 seconds off a 7-minute cold start, not a fix for that
+number. The actual cost driver is legitimate content (tool schemas,
+~10K tokens; AGENTS.md's real remaining content, ~6.4K tokens) plus, per
+earlier tonight's own test, conversation/tool-call history growing
+*within* a session (one test grew from 12K to 36K+ tokens through normal
+multi-round tool use -- dwarfing anything AGENTS.md contributes).
+Shrinking cold-start further from here would mean trading away tool
+capability or behavior guidance, not finding more bloat.
+
+Verified live: `AGENTS.md` 26,750 -> 25,848 chars (-902), confirmed via
+`openclaw agent --json`'s `systemPromptReport` on a fresh session --
+`systemPrompt.chars` 45,741 -> 44,842 (-899, matching almost exactly),
+`truncatedFiles: 0` still holds. Closing issue #2 here: found and fixed
+the one real bug (the truncation), found and cut the one real waste
+(`browser` tool), found and merged the two safe redundancies. What's
+left is legitimate content, not something to keep hunting for savings
+in.
