@@ -22,6 +22,7 @@ Usage:
 import argparse
 import http.client
 import json
+import socket
 import sys
 import time
 from pathlib import Path
@@ -69,6 +70,37 @@ def is_agent_alive(ip: str, timeout: float = 1.5) -> bool:
     liveness gate, not the response body (e.g. probing a candidate
     fast-path address -- see _select_best_address)."""
     return _agent_health(ip, timeout=timeout) is not None
+
+
+def _resolve_candidates(hostname: str) -> list[str]:
+    """All IPv4 addresses `hostname` resolves to, in the order the system
+    resolver returns them. Used instead of connecting to the ambiguous
+    hostname directly -- confirmed 2026-09-08 (see docs/LOG.md, "mDNS
+    resolution ambiguity under launchd") that a multi-homed mDNS hostname
+    like "prf-hays-exo02.local" (which resolves to both a Thunderbolt
+    link-local address and a LAN address) can land on an unreachable
+    candidate specifically under launchd ("No route to host"), even
+    though the exact same hostname resolves and connects fine
+    interactively -- the same "process context affects networking"
+    pattern documented in ARCHITECTURE.md's EHOSTUNREACH note. Trying
+    every candidate directly sidesteps needing to explain why, the same
+    way _select_best_address sidesteps needing a live speed test.
+    """
+    try:
+        _, _, addrs = socket.gethostbyname_ex(hostname)
+        return addrs
+    except OSError:
+        return []
+
+
+def _agent_health_any(candidates: list[str]) -> tuple[str | None, dict | None]:
+    """Tries _agent_health against each candidate IP in order, returning
+    the (ip, body) of the first one that answers -- or (None, None)."""
+    for ip in candidates:
+        health = _agent_health(ip)
+        if health is not None:
+            return ip, health
+    return None, None
 
 
 def discover_peers(agent_id: str, self_hostname: str | None = None) -> list[dict]:
@@ -119,14 +151,15 @@ def discover_peers(agent_id: str, self_hostname: str | None = None) -> list[dict
     for peer in mdns.discover_peers():
         if self_hostname is not None and _normalize_hostname(peer.hostname) == _normalize_hostname(self_hostname):
             continue
-        health = _agent_health(peer.hostname)
+        candidates = _resolve_candidates(peer.hostname) or [peer.hostname]
+        ip, health = _agent_health_any(candidates)
         if health is None:
             continue
         peers.append({
             "source": "mdns",
             "hostname": peer.hostname,
             "fast_paths": health.get("fast_paths", []),
-            "ip": peer.hostname,  # resolved hostname, not yet a bare IP
+            "ip": ip,  # a real resolved IP that answered, not the ambiguous hostname
             "port": peer.port,
         })
 

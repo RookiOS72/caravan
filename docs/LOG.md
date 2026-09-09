@@ -1597,3 +1597,51 @@ Not yet live-tested through a real `--apply` agent cutover (same
 caveat as the mDNS fallback work above) -- the logic is proven correct
 in isolation and via dry run, not yet proven under actual launchd
 supervision end to end.
+
+## Live cutover attempt: real launchd run surfaced mDNS resolution ambiguity under launchd too
+
+Went ahead with the live cutover (user: "let's do the next"). node-b:
+swapped `com.caravan.rpc-server` for `com.caravan.agent` cleanly --
+correctly self-detected tail role, spawned the identical `rpc-server
+--cache` command as its own child (confirmed via `ps -o pid,ppid`), and
+its `/health` correctly reported `fast_paths: ["169.254.72.237"]`
+through the real (not disposable-test) agent.
+
+node-a: bootstrapped `com.caravan.agent` for real -- and it fell back to
+single-node again, but for a *new* reason this time, not the already-
+known Tailscale-CLI-under-launchd issue (which is still present and
+still logged, confirmed unrelated). The mDNS path failed too:
+`_agent_health('prf-hays-exo02.local') failed: OSError(65, 'No route to
+host')`.
+
+Diagnosed rather than assumed: `prf-hays-exo02.local` is multi-homed --
+`dscacheutil -q host` shows it resolves to *both* the Thunderbolt
+link-local address (`169.254.72.237`) *and* node-b's LAN address
+(`192.168.1.38`), plus several IPv6 addresses. Interactively, resolving
+and connecting to that hostname happens to land on the working
+Thunderbolt address and succeeds instantly (confirmed: `ping` and a
+plain `socket.gethostbyname()` both picked `169.254.72.237` first, 0%
+loss). Under launchd, the exact same hostname connection attempt landed
+on something unreachable instead. This is the same "process context
+measurably affects network behavior on this hardware" pattern
+documented in `ARCHITECTURE.md`'s EHOSTUNREACH note and tonight's
+Tailscale-CLI finding -- a third independent instance of it, not fully
+explained mechanistically (same as the others), but now with a
+consistent mitigation pattern across all three: don't trust one
+ambiguous connection attempt from launchd's context, try explicit
+candidates instead.
+
+**Fix**: `_resolve_candidates(hostname)` resolves a hostname to *every*
+IPv4 address it has (`socket.gethostbyname_ex`) instead of connecting to
+the ambiguous hostname directly; `_agent_health_any(candidates)` tries
+each in order, same pattern as `_select_best_address`'s fast-path
+selection, just applied one level earlier at the initial peer-liveness
+check itself. Wired into `discover_peers`'s mDNS branch; the peer's
+recorded `"ip"` is now always a real resolved address that actually
+answered, not the ambiguous hostname string it used to be.
+
+Verified directly against the real failure before redeploying:
+`_resolve_candidates('prf-hays-exo02.local')` returns
+`['169.254.72.237', '192.168.1.38']`, and `_agent_health_any` correctly
+picks the first one. Not yet re-verified live under launchd as of this
+entry -- redeploying next.
