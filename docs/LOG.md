@@ -1939,3 +1939,54 @@ addressed earlier tonight, ported to this binary's shutdown path too.
 Synced to node-b and confirmed it builds there too (the discovery code
 is role-agnostic -- proven once, on the head-role path here; both roles
 share the exact same `discovery_mdns` code, not two implementations).
+
+## Full real end-to-end test: caravan.cpp as head and tail together, in production
+
+User turned exo off on both machines and explicitly greenlit testing
+against real production ports. Did the test that mattered most: `caravan`
+as head on node-a *and* tail on node-b, at the same time, on the real
+production ports (8080/50052), zero Python agent running on either
+side.
+
+Stopped both `com.caravan.agent` instances first (node-a, then node-b,
+same safe order as every other cutover tonight), confirmed no orphaned
+`llama-server`/`rpc-server` children on either side. Real gotcha caught
+immediately rather than after the fact: both nodes' `cpp/build/`
+directories had been `rm -rf`'d as part of earlier repo-sync cleanup and
+never rebuilt -- `nohup ./build/caravan` failed with "No such file or
+directory" on the first attempt. Rebuilt on both, then proceeded.
+
+Started tail (node-b) first so it was listening before head connected --
+confirmed live via `nc -zv` against the Thunderbolt address before even
+starting node-a. Started head (node-a) second: it discovered *both*
+itself and node-b via mDNS, correctly excluded itself, and built the
+full sharded `llama_server()` argv automatically -- `--rpc
+prf-hays-exo02.local:50052 --device MTL0,RPC0 --tensor-split 1,1`, the
+exact production shape, entirely self-organized.
+
+**It worked completely.** Loaded in under 30 seconds -- genuinely
+worth pausing on, since this is a *different* binary than the one that
+needed the Local Network permission grant earlier tonight (that fix was
+specific to the Python-spawned `llama-server` process; `caravan` is
+its own separate executable, so this wasn't guaranteed to inherit
+anything). No connection error at all. `kv_unified='false'`,
+`n_ctx_slot=65536` on all 4 slots, `/health` ok, and a real
+`/completion` request returned genuine generated text at
+`predicted_per_second: 6.03` -- matching the original manual Thunderbolt
+benchmark (6.1 tok/s) and tonight's earlier Python-agent Thunderbolt
+test (6.09 tok/s) almost exactly. Three independent measurements now
+agree.
+
+This is the full vision from tonight's "unified app" conversation
+actually working, live, together, for the first time: one binary, no
+subprocess anywhere, self-discovery with no manual `--peer`, correctly
+routed over the fastest available link, real inference at the expected
+speed. Not yet production-grade (no Tailscale fallback, no `--cache`,
+no crash supervision, no persistent identity) -- deliberately reverted
+back to the full-featured Python agent for actual production use
+afterward, confirmed restored and healthy with a real completion. This
+was validation, not a production swap.
+
+Both `caravan` processes and their `dns-sd` advertiser children
+confirmed cleanly killed afterward -- no orphans, no leftover mDNS
+registrations.
