@@ -1464,3 +1464,78 @@ not something to rush before a context switch. Next session picking
 this back up should start with the live cutover test (mDNS-fallback
 path specifically), now that the code is believed correct but unproven
 live.
+
+## The cable arrived, tested live -- issue #5 resolved, RDMA confirmed unavailable on this hardware
+
+The USB4/Thunderbolt cable arrived two days early; user plugged it in
+mid-session while in the middle of a different project (openclaw now
+running with exo/MLX as primary, not Caravan -- see below). Tested it
+live rather than waiting for a dedicated session.
+
+**Environment had drifted since the last Caravan session**, discovered
+by checking rather than assuming: `openclaw.json`'s primary model is
+now `exo/mlx-community/gemma-4-31b-it-6bit`; every `com.caravan.*`
+launchd job was gone from node-a entirely (not stopped -- absent); and
+node-b's SSH at `192.168.1.39` timed out because its LAN IP had changed
+to `192.168.1.38` (an ordinary DHCP change, unrelated to anything else
+-- caught via Tailscale's `status` output showing the new address in
+its "direct" connection line, since node-b's Tailscale IP itself,
+`100.90.134.95`, hadn't changed). Node-b's `rpc-server` was also found
+running from the old stale `~/Library/LaunchAgents/` copy again, without
+`--cache` -- the file had reappeared despite being deleted earlier this
+week (cause not investigated; possibly a Time Machine/local-snapshot
+restore tied to whatever the other session did). Fixed the same way as
+before: bootout, remove the stale copy, bootstrap from the repo path.
+
+**Confirmed the physical link first, before any benchmark**: `en2`
+(Thunderbolt 1 port, per `networksetup -listallhardwareports`) came up
+active on both nodes with standard macOS link-local addresses on the
+same /16 (node-a `169.254.121.90`, node-b `169.254.72.237`) -- a plain
+`ping` between them showed clean sub-millisecond RTT, 0% loss.
+
+**First benchmark attempt was misleading**, caught before drawing a
+wrong conclusion: ran llama-server manually (not via the launchd plist
+-- this was a benchmark, not a permanent config change) with `--rpc`
+pointed at the Thunderbolt link-local IP instead of Tailscale's. Loaded
+in 39.8s -- but node-b's disk cache (issue #3's `--cache`) was still
+warm from before, so the entire "load" may have been served from local
+disk via content-hash matching, zero bytes actually moved over any
+transport. Re-ran it properly: cleared node-b's cache dir (874 files,
+accumulated since issue #3 was implemented) to force a genuine cold
+transfer, and timed that instead.
+
+**Real result, genuine cold transfer**: **29-39 seconds**, cache
+re-populated to the expected 151 files / 7.6GB confirming real data
+moved. Compare to the documented WiFi cold baseline of 7-11 minutes
+(420-660s) -- **roughly 14-22x faster**. Generation speed also improved:
+6.1 tok/s vs. the ~3.8-4.5 tok/s baseline all night over WiFi (lower
+per-token RPC round-trip latency over a wired link vs. WiFi). Prompt
+processing on a 149-token prompt: 48.5 tok/s, in line with historical
+numbers -- unsurprising, prompt processing was never network-bound the
+way cold-load and per-token generation were.
+
+**RDMA itself never activated** -- no `RDMA(Apple/UC) probed`/`activated`
+line on either side, just the generic `TCP (RDMA auto-negotiate
+enabled)` startup banner. User asked directly whether RDMA is even
+available on M4 -- checked rather than assumed: **RDMA over Thunderbolt
+requires Thunderbolt 5, available only on M4 Pro, M4 Max, or M3 Ultra**
+(source: Apple's TN3205 and AppleInsider's coverage of the macOS 26.2
+beta feature). Confirmed via `system_profiler`: this hardware is plain
+Apple M4, and the negotiated link speed is "40 Gb/s" -- Thunderbolt
+4/USB4, not Thunderbolt 5's 80-120 Gb/s. So RDMA is a genuine, permanent
+hardware ceiling on this specific hardware, not a config problem to keep
+chasing. The 14-22x speedup already measured is entirely from swapping
+WiFi for wired Thunderbolt 4 in plain-TCP mode -- and that's the whole
+result; there's no RDMA-specific follow-up to pursue on these two Macs.
+
+Issue #5 closed as resolved. This was a manual benchmark process, not
+wired into the launchd plist or openclaw -- node-a's `llama-server` plist
+still points at the Tailscale IP as its checked-in config. Whether to
+make the Thunderbolt link the permanent `--rpc` target (and how that
+interacts with the still-unresolved agent-based head cutover from
+earlier tonight) is a real follow-up, not decided here -- this session
+was specifically about answering "does the cable help," not migrating
+production. Left the benchmark llama-server process running rather than
+tearing it down mid-write-up; cleanup/restoration to be decided based on
+whether Caravan or exo should be openclaw's active primary right now,
+which is the other project's call, not this one's.
