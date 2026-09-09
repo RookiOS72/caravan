@@ -1834,3 +1834,55 @@ original manual Thunderbolt benchmark's 6.1 tok/s almost exactly. This
 is the first time tonight the entire chain -- agent discovery, fast-path
 selection, and llama-server's actual connection -- has worked together
 under real process supervision, not a manual workaround.
+
+## Unified binary v0: proved llama.cpp's own library calls work in-process
+
+Step 2's first milestone: prove the core "no subprocess" idea before
+porting any of `agent/`'s discovery/health/supervision logic. Checked
+the actual entry points before writing anything (`tools/server/main.cpp`
+is literally `return llama_server(argc, argv);`; `ggml-rpc.h` exports
+`ggml_backend_rpc_start_server(...)` as a real public API) -- both roles
+have clean, already-proven, directly linkable entry points, not
+something to reimplement.
+
+New `cpp/` directory: `CMakeLists.txt` linking against the existing
+`~/dev/llama.cpp` build (proper submodule vendoring deferred until this
+was proven worth it), `main.cpp` porting `ollama_store.py`'s model-
+detection logic to C++ (using the JSON library already vendored inside
+llama.cpp itself, `vendor/nlohmann` -- no new dependency), then
+dispatching to whichever role's library call applies.
+
+One real bug caught immediately by testing rather than trusting the
+diff: declared `llama_server` as `extern "C"`, matching how a C library
+function normally gets declared -- linker failure. It's a plain C++
+function (confirmed by the mangled symbol name `_Z12llama_serveriPPc`
+seen in tonight's earlier crash backtraces); `tools/server/main.cpp`
+itself declares it with no `extern "C"`. Fixed by matching that.
+
+**Both roles verified live, not just "it compiles":**
+
+- Head: ran single-node (no peer) on a scratch port. `/health` came up
+  correctly inside `caravan`'s own process. A real completion request
+  hit a genuine Metal OOM (`kIOGPUCommandBufferCallbackErrorOutOfMemory`)
+  -- expected, not a bug: this is the full 30B model on one 24GB
+  machine, competing with the real production process's own GPU memory
+  at the same time. This model is normally sharded specifically because
+  one node can't comfortably hold it alone.
+- Tail: built and ran on node-b (which genuinely lacks the model
+  locally, so correctly self-detects tail), on a scratch port. A real
+  TCP connection succeeded against it (`nc -zv` over the Thunderbolt
+  link).
+- Confirmed via `ps -ef` during both tests: only `caravan` itself ever
+  existed as a process. No `llama-server`/`rpc-server` child, on either
+  node, at any point.
+
+Both roles' test ports reverted to the real production values (8080,
+50052) before committing -- the scratch ports were only to avoid
+colliding with the live production processes during testing.
+
+**Not built yet, and said plainly rather than implied**: mDNS/Tailscale
+discovery, the health server + `fast_paths` reporting, auto-select-
+fastest-path, persistent identity -- everything `agent/` already does.
+This milestone answers the one question that mattered before committing
+to porting all of that: do the library calls actually work standing
+alone, in-process. They do, for both roles, verified live.
