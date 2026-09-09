@@ -1886,3 +1886,56 @@ fastest-path, persistent identity -- everything `agent/` already does.
 This milestone answers the one question that mattered before committing
 to porting all of that: do the library calls actually work standing
 alone, in-process. They do, for both roles, verified live.
+
+## Unified binary v0.1: mDNS self-discovery, replacing the hardcoded --peer
+
+Next obvious step after v0: port `agent/discovery/mdns.py` so `caravan`
+can find its own peer instead of needing `--peer` passed by hand.
+
+Two new small modules: `subprocess.{h,cpp}` (a POSIX fork/exec/pipe/poll
+utility -- `dns-sd -B`/`-L` stream forever with no "give me one result
+and exit" flag, same reason the Python version needed its own
+`_run_timeboxed`) and `discovery_mdns.{h,cpp}` (a direct C++ port of the
+Python module: same `dns-sd` CLI, same two regexes translated to
+`std::regex`, same browse-then-resolve-then-advertise shape).
+
+Hit the exact same stdout-buffering issue as the rest of tonight's
+Python work, just in C++ this time: `printf` sits in libc's buffer
+indefinitely once stdout isn't a tty. Fixed with `setvbuf(stdout,
+nullptr, _IONBF, 0)` at the top of `main()` -- the C equivalent of
+tonight's repeated Python `-u` fix.
+
+**Verified live, not just compiled**: ran `caravan` standalone (scratch
+local port to avoid the real 8080). It correctly advertised itself,
+discovered *both* itself and the real node-b peer via mDNS, and
+correctly excluded itself from selection (`normalize_hostname` -- the
+same self-discovery bug the Python port hit first, caught here before
+it ever ran for real by porting the fix at the same time as the
+feature). Built the exact same head command production long ago proved
+correct, fully automatically: `--rpc prf-hays-exo02.local:50052
+--device MTL0,RPC0 --tensor-split 1,1`. `--peer` is no longer required
+at all, just kept as a manual override.
+
+**Real mistake, caught and verified harmless rather than assumed**:
+only the local `llama_server_port` had been overridden for the test --
+the discovered peer's RPC port was still the real production value
+(50052), so this test connected to node-b's actual live `rpc-server`
+instead of a scratch one. Realized this immediately from the printed
+args, killed the test right away, then verified rather than hoped:
+production's `/health`, `/slots`, and a real `/completion` request all
+still worked correctly afterward, node-b's `rpc-server` PID was
+unchanged (no crash/restart), and its log showed only a clean "Client
+connection closed" from the killed test -- a harmless connect/disconnect,
+not a request that actually touched the shared session. Lesson for next
+time: override *both* the local bind port and route test traffic to a
+scratch port on the peer's side too, not just the local one.
+
+Also verified the signal-handler cleanup path works: killing `caravan`
+correctly terminated its `dns-sd -R` advertiser child (checked via `ps`
+for the specific child pid) rather than leaking it -- the same
+orphaned-child risk `agent/supervisor.py`'s SIGTERM-forwarding fix
+addressed earlier tonight, ported to this binary's shutdown path too.
+
+Synced to node-b and confirmed it builds there too (the discovery code
+is role-agnostic -- proven once, on the head-role path here; both roles
+share the exact same `discovery_mdns` code, not two implementations).

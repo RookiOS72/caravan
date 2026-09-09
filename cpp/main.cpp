@@ -1,12 +1,13 @@
-// caravan (v0): proves the core "no subprocess" idea for the unified
-// binary described in docs/ARCHITECTURE.md -- role detection, then a
-// direct in-process call into llama.cpp's own library entry points
-// instead of spawning `llama-server`/`rpc-server` as child processes.
+// caravan (v0.1): the "no subprocess" unified binary from
+// docs/ARCHITECTURE.md, now with real mDNS self-discovery instead of a
+// hardcoded peer -- role detection, discover the other node on the LAN,
+// then a direct in-process call into llama.cpp's own library entry
+// points instead of spawning `llama-server`/`rpc-server` as children.
 //
-// Deliberately narrow for now: no mDNS/Tailscale discovery, no health
-// server, no fast-path selection -- those already work in the Python
-// agent (see ../agent/) and are meant to be ported once this core
-// mechanism is proven. Peer address is a plain CLI flag here.
+// Still narrow: no Tailscale discovery, no health server, no fast-path
+// (Thunderbolt) selection yet -- those already work in the Python agent
+// (see ../agent/) and are the next pieces to port. `--peer` stays
+// available as a manual override for testing.
 //
 // Both role entry points are real, already-public llama.cpp APIs, not
 // anything reimplemented here:
@@ -18,6 +19,11 @@
 #include <ggml-backend.h>
 #include <ggml-rpc.h>
 
+#include <signal.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "discovery_mdns.h"
 #include "json.hpp"
 
 using json = nlohmann::json;
@@ -37,7 +44,34 @@ const int llama_server_port = 8080;
 const int rpc_port = 50052;
 const int n_slots = 4;
 const int ctx_per_slot = 65536;
+// Not actually listened on yet (no health server built here yet -- see
+// agent/health_server.py for the piece this will eventually replace).
+// Advertised now anyway so the value is already consistent once that
+// piece is ported, rather than changing every peer's expected port
+// later.
+const int agent_port = 8091;
 }  // namespace config
+
+// Best-effort node-identity match, matching agent/caravan_agent.py's
+// _normalize_hostname: strips a trailing ".local"/domain suffix and
+// lowercases, so this node's own mDNS advertisement (e.g.
+// "prf-hays-exo01-2.local") is recognized as itself and not treated as
+// a peer -- the exact bug the Python port hit first (see docs/LOG.md,
+// "mDNS fallback").
+std::string normalize_hostname(const std::string & hostname) {
+    std::string base = hostname.substr(0, hostname.find('.'));
+    std::transform(base.begin(), base.end(), base.begin(),
+                    [](unsigned char c) { return std::tolower(c); });
+    return base;
+}
+
+std::string local_hostname() {
+    char buf[256];
+    if (gethostname(buf, sizeof(buf)) != 0) {
+        return "";
+    }
+    return std::string(buf);
+}
 
 namespace ollama_store {
 
@@ -180,7 +214,30 @@ int run_as_tail() {
     return 0;
 }
 
+namespace {
+pid_t g_advertiser_pid = -1;
+
+// Both role entry points block forever (that's what running a server
+// means), so the only place cleanup can happen is a signal handler --
+// mirrors agent/caravan_agent.py's `finally: advertiser.terminate()`,
+// just reached via SIGTERM/SIGINT here instead of a Python return path.
+// Without this, a stopped caravan process would leave a stale mDNS
+// registration behind (see discovery_mdns.h's advertise_start doc).
+void handle_shutdown_signal(int) {
+    if (g_advertiser_pid > 0) {
+        kill(g_advertiser_pid, SIGTERM);
+    }
+    _exit(0);
+}
+}  // namespace
+
 int main(int argc, char ** argv) {
+    // Unbuffered: printf output otherwise sits in libc's buffer
+    // indefinitely once stdout isn't a tty (launchd logs, `> file`
+    // redirection) -- the exact same class of issue hit repeatedly
+    // tonight with Python's own stdout buffering under launchd.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
     std::string peer;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
@@ -188,17 +245,48 @@ int main(int argc, char ** argv) {
         }
     }
 
+    signal(SIGTERM, handle_shutdown_signal);
+    signal(SIGINT, handle_shutdown_signal);
+
+    std::string self_hostname = local_hostname();
+    printf("[caravan] hostname=%s\n", self_hostname.c_str());
+
+    g_advertiser_pid = discovery::mdns::advertise_start(self_hostname, config::agent_port);
+    printf("[caravan] advertising via mDNS as '%s' (pid %d)\n", self_hostname.c_str(), g_advertiser_pid);
+
+    if (peer.empty()) {
+        auto discovered = discovery::mdns::discover_peers();
+        printf("[caravan] discovered %zu peer(s):\n", discovered.size());
+        for (const auto & p : discovered) {
+            printf("    mdns  %s  %s:%d\n", p.instance_name.c_str(), p.hostname.c_str(), p.port);
+        }
+        for (const auto & p : discovered) {
+            if (normalize_hostname(p.hostname) != normalize_hostname(self_hostname)) {
+                peer = p.hostname;
+                break;
+            }
+        }
+    }
+
     bool have_model = ollama_store::has_model(config::target_model);
     printf("[caravan] target model: %s -- %s\n", config::target_model.c_str(),
            have_model ? "present locally" : "not present locally");
 
+    int rc;
     if (have_model) {
         std::string blob_path = ollama_store::resolve_blob_path(config::target_model);
         if (blob_path.empty()) {
             fprintf(stderr, "[caravan] error: manifest found but GGUF blob missing\n");
-            return 1;
+            rc = 1;
+        } else {
+            rc = run_as_head(blob_path, peer);
         }
-        return run_as_head(blob_path, peer);
+    } else {
+        rc = run_as_tail();
     }
-    return run_as_tail();
+
+    if (g_advertiser_pid > 0) {
+        kill(g_advertiser_pid, SIGTERM);
+    }
+    return rc;
 }

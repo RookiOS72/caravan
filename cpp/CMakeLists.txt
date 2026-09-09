@@ -14,6 +14,8 @@ set(LLAMA_CPP_BUILD_DIR "${LLAMA_CPP_DIR}/build" CACHE PATH "Path to that checko
 
 add_executable(caravan
     main.cpp
+    subprocess.cpp
+    discovery_mdns.cpp
 )
 
 target_include_directories(caravan PRIVATE
