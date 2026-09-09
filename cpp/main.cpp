@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "discovery_mdns.h"
+#include "discovery_tailscale.h"
 #include "json.hpp"
 
 using json = nlohmann::json;
@@ -256,15 +257,41 @@ int main(int argc, char ** argv) {
 
     if (peer.empty()) {
         auto discovered = discovery::mdns::discover_peers();
-        printf("[caravan] discovered %zu peer(s):\n", discovered.size());
+        printf("[caravan] discovered %zu mdns peer(s):\n", discovered.size());
         for (const auto & p : discovered) {
             printf("    mdns  %s  %s:%d\n", p.instance_name.c_str(), p.hostname.c_str(), p.port);
         }
+
+        // Tailscale is not an independent trust source here -- there's
+        // no health server yet (see discovery_tailscale.h) to verify a
+        // Tailscale peer is actually running Caravan, not just some
+        // other machine on the same tailnet (the exact bug the Python
+        // agent's is_agent_alive gate exists to prevent -- see
+        // agent/caravan_agent.py's docstring). Only used to *upgrade*
+        // the address of a peer mDNS already validated by finding its
+        // real _caravan._tcp advertisement, matching ARCHITECTURE.md's
+        // stated Tailscale-over-LAN preference without reopening that
+        // trust gap.
+        auto ts_peers = discovery::tailscale::get_peers();
+        printf("[caravan] discovered %zu tailscale peer(s) (address-upgrade only):\n", ts_peers.size());
+        for (const auto & p : ts_peers) {
+            printf("    tailscale  %s  %s  online=%s\n", p.hostname.c_str(), p.tailscale_ip.c_str(),
+                   p.online ? "true" : "false");
+        }
+
         for (const auto & p : discovered) {
-            if (normalize_hostname(p.hostname) != normalize_hostname(self_hostname)) {
-                peer = p.hostname;
-                break;
+            if (normalize_hostname(p.hostname) == normalize_hostname(self_hostname)) {
+                continue;
             }
+            peer = p.hostname;
+            for (const auto & tp : ts_peers) {
+                if (tp.online && normalize_hostname(tp.hostname) == normalize_hostname(p.hostname)) {
+                    peer = tp.tailscale_ip;
+                    printf("[caravan] upgraded %s to Tailscale IP %s\n", p.hostname.c_str(), peer.c_str());
+                    break;
+                }
+            }
+            break;
         }
     }
 

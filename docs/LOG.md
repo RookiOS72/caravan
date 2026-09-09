@@ -1990,3 +1990,60 @@ was validation, not a production swap.
 Both `caravan` processes and their `dns-sd` advertiser children
 confirmed cleanly killed afterward -- no orphans, no leftover mDNS
 registrations.
+
+User: no need to revert to the Python agent after every test going
+forward -- only if/when actually needed at the end of a session. Noted;
+stopped doing the revert-and-restore cycle after each individual test
+from here on.
+
+## Unified binary: Tailscale discovery (address-upgrade only, not an independent trust source)
+
+Ported `agent/discovery/tailscale.py` to C++ next: new
+`discovery_tailscale.{h,cpp}`, same App-bundle-then-PATH binary lookup,
+same `status --json` call via the existing `subprocess::run_timeboxed`.
+
+Real design decision, not just a straight port: there's no health
+server yet in the C++ binary (see `agent/health_server.py` for the piece
+this doesn't have yet), so there's no way to independently verify a
+Tailscale peer is actually running Caravan rather than some other
+machine on the same tailnet -- the exact gap `is_agent_alive()` exists
+to close in the Python agent. Rather than reopen that trust hole, wired
+Tailscale in as an *address upgrade* for peers mDNS already validated
+(matches `ARCHITECTURE.md`'s stated Tailscale-over-LAN preference)
+rather than as an independent discovery source. Verified this is the
+right call live: real tailnet output included an unrelated machine
+(`prf-hays-mgmt`, the same one that showed up as a false positive in the
+original Python agent testing) -- correctly *not* trusted, since it was
+never found via mDNS.
+
+**Real bug, caught by testing rather than trusting the diff**: first
+version segfaulted (exit code 139) every time, deep inside the peer-
+iteration loop, before printing anything. Debugged properly rather than
+guessing -- `lldb` kept timing out non-interactively (batch mode not
+behaving as expected, abandoned after two attempts rather than fighting
+it further), so added temporary `fprintf(stderr, ...)` diagnostics at
+each step instead and rebuilt incrementally. Narrowed it to the very
+first loop iteration, before it could even print which key it was on.
+
+Root cause: `for (const auto & [key, peer] : data.value("Peer",
+json::object()).items())` -- a well-documented `nlohmann::json` pitfall.
+`.items()` returns a proxy holding a *reference* to the json object it
+was called on; `data.value(...)` returns a *temporary*. That temporary
+is destroyed once the full expression finishes evaluating, before the
+loop body ever runs -- the proxy is left holding a dangling reference,
+and iterating it is undefined behavior. Fixed by binding the
+intermediate value to a named variable (`json peer_map = data.value(...)`)
+first, which keeps it alive for the loop's actual duration, then calling
+`.items()` on that. Verified the fix directly: real Tailscale JSON
+(7027 bytes, 3 real peers including the online/offline and unrelated-
+machine cases) parsed and iterated correctly, no crash, and the address-
+upgrade logic worked exactly as designed.
+
+Also cleaned up leftover `dns-sd -R` processes from the crashed test
+runs -- each crash skipped the normal SIGTERM-handler cleanup path
+(`_exit`-on-segfault doesn't run application signal handlers), so those
+had to be killed by hand rather than relying on the usual shutdown path.
+Confirmed the real production advertiser (a different pid, still
+running the whole time) was left untouched.
+
+Builds clean on both nodes.

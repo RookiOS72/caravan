@@ -33,10 +33,26 @@ Real, tested (not just compiles):
   hit first), and builds the full sharded `llama_server()` argv
   automatically -- `--peer` is no longer required, only kept as a manual
   override for testing.
+- **Tailscale discovery**: `discovery_tailscale.{h,cpp}`, a port of
+  `agent/discovery/tailscale.py`. Deliberately *not* an independent
+  trust source yet -- no health server exists here to verify a Tailscale
+  peer is really running Caravan, so it's only used to upgrade the
+  address of a peer mDNS already validated (matches
+  `docs/ARCHITECTURE.md`'s stated Tailscale-over-LAN preference).
+  Verified live against a real, messy tailnet (an unrelated machine, an
+  offline entry, the real peer): correctly upgraded the real peer's
+  address to its Tailscale IP and correctly ignored the unrelated
+  machine since it was never seen via mDNS.
+- **Full real end-to-end test**: `caravan` as head *and* tail
+  simultaneously, on real production ports, zero Python involved on
+  either side. Self-discovered each other via mDNS, loaded in under 30s,
+  served a real completion at 6.03 tok/s -- matching two independent
+  earlier Thunderbolt measurements almost exactly. See `docs/LOG.md`,
+  "Full real end-to-end test."
 
 **Not done yet** -- everything else `agent/` already does in Python:
-Tailscale discovery, the `/health` + `fast_paths` server, the
-auto-select-fastest-path logic, persistent node identity.
+the `/health` + `fast_paths` server, `--cache` for the tail role,
+persistent node identity, crash supervision.
 
 Ollama model detection (`ollama_store::has_model`/`resolve_blob_path`)
 is a straight port of `agent/ollama_store.py`'s logic, using the JSON

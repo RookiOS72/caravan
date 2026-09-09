@@ -16,6 +16,7 @@ add_executable(caravan
     main.cpp
     subprocess.cpp
     discovery_mdns.cpp
+    discovery_tailscale.cpp
 )
 
 target_include_directories(caravan PRIVATE
