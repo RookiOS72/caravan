@@ -20,9 +20,9 @@ Usage:
     python3 caravan_agent.py --model llama3    # target a different model
 """
 import argparse
-import http.client
 import json
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -47,19 +47,27 @@ def _agent_health(ip: str, timeout: float = 1.5) -> dict | None:
     Returns the full body (not just True/False) so callers can read a
     peer's self-reported `fast_paths` (Thunderbolt addresses -- see
     discovery/thunderbolt.py) without a second round trip.
+
+    Shells out to `curl` rather than using http.client/socket directly.
+    Confirmed 2026-09-08 (see docs/LOG.md, "curl vs. Python socket under
+    launchd"): under real launchd supervision, Python's own
+    socket.create_connection() failed with "No route to host" against an
+    address (169.254.72.237, the Thunderbolt link) that `curl` reached
+    instantly from the exact same launchd process context, run back to
+    back. A fourth instance of this hardware's "process context affects
+    networking" pattern, but this time with a clean, verified fix rather
+    than a workaround for ambiguity -- Python's socket stack specifically
+    is what launchd doesn't like here, not the network path itself.
     """
     try:
-        conn = http.client.HTTPConnection(ip, config.AGENT_PORT, timeout=timeout)
-        conn.request("GET", "/health")
-        resp = conn.getresponse()
-        if resp.status != 200:
-            resp.read()
-            conn.close()
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", str(timeout), f"http://{ip}:{config.AGENT_PORT}/health"],
+            capture_output=True, text=True, timeout=timeout + 1,
+        )
+        if result.returncode != 0 or not result.stdout:
             return None
-        body = json.loads(resp.read())
-        conn.close()
-        return body
-    except (OSError, json.JSONDecodeError) as exc:
+        return json.loads(result.stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as exc:
         print(f"[caravan-agent] _agent_health({ip!r}) failed: {exc!r}")
         return None
 

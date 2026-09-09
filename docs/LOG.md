@@ -1645,3 +1645,37 @@ Verified directly against the real failure before redeploying:
 `['169.254.72.237', '192.168.1.38']`, and `_agent_health_any` correctly
 picks the first one. Not yet re-verified live under launchd as of this
 entry -- redeploying next.
+
+## curl vs. Python socket under launchd -- the real fix
+
+Redeployed the candidate-resolution fix above and re-tested live: still
+failed, and worse than expected -- *both* resolved candidates
+(`169.254.72.237` and `192.168.1.38`) failed with `OSError(65, 'No
+route to host')`, including the Thunderbolt address that had just
+worked fine moments earlier in an interactive test with the identical
+code. Not a DNS ambiguity problem after all; something more fundamental
+about *this specific launchd process* reaching that address at all via
+Python.
+
+Tested directly rather than theorizing further: built a throwaway
+one-off launchd job (`/tmp/com.caravan.difftest.plist`, bootstrapped,
+read its log, torn down) running a tiny script that tried both `curl`
+(subprocess) and `socket.create_connection()` (Python's own stack)
+against the same address, back to back, in the same process. Result:
+**`curl` connected instantly; the Python socket call failed with the
+exact same "No route to host"** -- in the same launchd context, same
+moment, same target. This rules out a general network/routing block
+(curl proves the path is fine) and points specifically at Python's
+socket stack behaving differently under launchd on this hardware --
+consistent with, but a new and more precise instance of, the "process
+context measurably affects networking" pattern from `ARCHITECTURE.md`'s
+EHOSTUNREACH note, the Tailscale-CLI-under-launchd finding, and the
+mDNS-ambiguity investigation above -- now with an actual verified
+mechanism (Python vs. curl) instead of an unexplained workaround.
+
+**Fix**: `_agent_health()` now shells out to `curl` instead of using
+`http.client`/`socket` -- same interface, same return type, just a
+different transport underneath. Removed the now-unused `http.client`
+import. Verified interactively first (still correctly returns the
+health body for a reachable address and `None` for an unreachable one)
+before redeploying live.
