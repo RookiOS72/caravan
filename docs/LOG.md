@@ -1758,3 +1758,79 @@ Thunderbolt itself, only the head does. Cleaned up all throwaway test
 plists/scripts (`/tmp/com.caravan.difftest.plist`,
 `com.caravan.spawntest.plist`, `com.caravan.directtest.plist` and their
 logs) -- nothing left behind.
+
+## The actual root cause: macOS Local Network permission, not a code bug at all
+
+User's follow-up question reframed the plan: "unified app" meant the
+already-decided submodule + patch-branch vendoring (see the earlier
+"single unified app" entry), not a full Go/Rust/Swift rewrite -- so
+patching llama.cpp and building the unified app aren't competing options,
+the patch just needs to happen *in* the vendored fork rather than as a
+one-off edit. User then raised a real, deeper version: not just vendored
+source, but llama.cpp linked as a library in one Caravan binary with no
+subprocess spawning at all. Corrected an overclaim from earlier in that
+discussion: eliminating the subprocess boundary would *not* have avoided
+this bug -- the decisive test in the previous entry already proved a
+*direct* launchd-to-llama-server spawn (no Python, no subprocess chain)
+fails identically, so a unified binary would hit the same wall.
+
+Set up the vendoring infra first: forked `ggml-org/llama.cpp` to
+`RookiOS72/llama.cpp` (`gh repo fork`), renamed the original `origin` to
+`upstream`, added the fork as the new `origin`, created a `caravan-patches`
+branch off the pinned known-good commit (`6a1a922`, same commit both
+nodes have been running all night).
+
+**Wrote and tested the getaddrinfo() patch -- it did not fix the issue.**
+Replaced `gethostbyname()` with `getaddrinfo()` in
+`transport.cpp`'s `socket_t::connect()`, matching the file's own existing
+helper-function style (`is_valid_fd`, a new `close_fd` alongside it).
+Rebuilt, confirmed via `nm -u` that the library now actually links
+`getaddrinfo` not `gethostbyname`. Retested the exact same decisive
+launchd-direct-spawn scenario from the previous entry: **failed
+identically, twice**. This disproved the leading hypothesis -- and
+exposed a real reasoning gap worth naming: Python's own
+`socket.create_connection()` already uses `getaddrinfo()` internally (has
+for years), so the earlier "Python socket vs. curl" test was *already*
+comparing two getaddrinfo-based paths. The resolver-API theory should
+have been caught as wrong before ever writing the patch, not after
+testing it.
+
+**Real root cause, found by asking the user to check something only
+visible in the GUI**: macOS's Local Network privacy permission
+(Settings -> Privacy & Security -> Local Network). A permission dialog
+had been firing on every test tonight -- invisible over a remote shell,
+never seen or answered. `llama-server` itself isn't listed there at all
+(an unsigned, ad-hoc raw CLI binary apparently doesn't get its own
+trackable entry), but "Terminal" and "Python" are, and both were already
+toggled on. Confirmed that alone wasn't sufficient: a direct
+launchd-spawned `llama-server` (no Python parent) still failed even with
+both toggled on -- consistent with it having no grantable identity of
+its own to inherit from. The decisive confirmation: spawning
+`llama-server` *as a child of Python* (subprocess.Popen, exactly how the
+real agent does it) succeeded immediately -- real generated content,
+confirmed via an actual `/completion` call, not just a healthy PID. macOS's
+Local Network grant propagates from a permitted parent process to its
+children; a bare launchd-direct child has no such parent to inherit
+from. This is presumably the actual mechanism behind all four "process
+context affects networking" findings tonight, not four separate causes.
+
+**Caveat, not yet isolated**: the successful test ran with the
+getaddrinfo-patched binary already built and deployed -- whether
+`gethostbyname()` alone would now also succeed with the permission
+granted was never re-tested in isolation, since doing so would mean
+another rebuild/restart cycle purely to satisfy that question rather
+than fixing anything. The patch stays in place: it's deployed, working,
+and a legitimate modernization on its own merits (a live syscall vs. a
+deprecated 1980s-era API) even if it turns out not to have been
+strictly necessary.
+
+**Live-verified the real production path end to end**: cut node-a back
+over to `com.caravan.agent` for real. It correctly discovered node-b via
+the mDNS-with-curl-fix path, auto-selected the Thunderbolt address for
+`--rpc` (the auto-select-fastest-path feature from earlier tonight,
+finally exercised for real under launchd), and `llama-server` loaded and
+served a real completion -- `predicted_per_second: 6.09`, matching the
+original manual Thunderbolt benchmark's 6.1 tok/s almost exactly. This
+is the first time tonight the entire chain -- agent discovery, fast-path
+selection, and llama-server's actual connection -- has worked together
+under real process supervision, not a manual workaround.
