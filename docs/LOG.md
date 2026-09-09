@@ -1679,3 +1679,82 @@ different transport underneath. Removed the now-unused `http.client`
 import. Verified interactively first (still correctly returns the
 health body for a reachable address and `None` for an unreachable one)
 before redeploying live.
+
+## The real limit: llama-server itself can't reach Thunderbolt under launchd, at all
+
+With the curl fix, node-a's discovery finally worked correctly end to
+end: `discovered 1 peer(s): mdns prf-hays-exo02.local 169.254.72.237`,
+and the agent correctly built the full sharded command with the
+Thunderbolt address selected (`--rpc 169.254.72.237:50052 --device
+MTL0,RPC0 --tensor-split 1,1`) -- the auto-select-fastest-path feature's
+own logic worked exactly as designed. But `llama-server` itself then
+crash-looped: `ggml-rpc.cpp:547: Failed to connect to
+169.254.72.237:50052` -> `ggml_abort`, repeatedly, every ~10s
+(`supervise()`'s restart_delay).
+
+Isolated methodically rather than guessing, stopping the crash loop
+first (`bootout`, confirmed no orphan -- the SIGTERM-forwarding fix from
+earlier tonight worked correctly here too):
+
+1. Ruled out a real network/link problem: `ping`, `nc -zv`, and `curl`
+   (against the health port) all succeeded against the exact same
+   address, moments apart. Node-b's rpc-server was confirmed healthy
+   and listening throughout.
+2. Reproduced in complete isolation with a throwaway one-off launchd job
+   running nothing but `subprocess.Popen([llama-server, --rpc,
+   169.254.72.237:50052, ...])` -- same failure, ruling out anything
+   specific to `caravan_agent.py`/`supervisor.py`'s own code.
+3. Ran the *identical* script interactively (not via launchd) --
+   succeeded. Confirmed via node-b's own rpc-server log, which showed
+   real `[set_tensor] saved to ...` lines and live Metal kernel
+   compilation while that process was up, not just a healthy-looking
+   PID.
+4. Ran the identical launchd-Python-subprocess pattern again, this time
+   targeting the Tailscale IP (`100.90.134.95`) instead of Thunderbolt --
+   succeeded. Isolates the failure to the Thunderbolt link-local address
+   specifically, not "launchd grandchild processes can't make RPC
+   connections" in general.
+5. **The decisive test**: had launchd spawn `llama-server` *directly*,
+   no Python involved at all -- a throwaway copy of the real, always-
+   proven `com.caravan.llama-server.plist` with only the `--rpc` IP
+   swapped to Thunderbolt. **Still failed**, identical error. This rules
+   out Python/subprocess.Popen as the cause entirely: it's launchd
+   itself (of any kind, direct or via a Python grandchild) that can't
+   reach this specific address, full stop.
+
+Best-supported explanation, not yet proven with source-level certainty:
+`ggml-rpc.cpp`'s `socket_t::connect()` (`transport.cpp`) resolves the
+target via the legacy `gethostbyname()` API before calling raw
+`::connect()`. Every *working* case in this investigation (curl reaching
+the same IP under the same launchd context; `is_agent_alive`'s own curl
+call) goes through a modern `getaddrinfo()`-based resolver internally.
+macOS's network sandboxing for non-interactive/background processes is
+documented to sometimes treat legacy resolver APIs differently than
+modern ones -- consistent with, and a more precise instance of, this
+hardware's now four-times-observed "process context affects networking"
+pattern (`ARCHITECTURE.md`'s EHOSTUNREACH note, the Tailscale-CLI
+finding, the mDNS-ambiguity finding, and this one) -- but this is the
+first one where the actual API-level distinction (legacy resolver vs.
+modern resolver) is a concrete, plausible mechanism rather than an
+unexplained workaround.
+
+**Practical consequence**: `llama-server`, launchd-supervised, currently
+cannot use the Thunderbolt link-local address at all -- only an
+interactively-spawned process can (confirmed: tonight's original manual
+benchmark, run via a plain background shell process, worked perfectly).
+The auto-select-fastest-path feature's own logic is fully correct and
+verified; what's blocked is llama-server actually being able to use what
+it correctly selects, once under real process supervision. Not
+fixable from Caravan's own code -- would need a patch to
+`ggml-rpc.cpp`'s `socket_t::connect()` (swap `gethostbyname()` for
+`getaddrinfo()`), which is real llama.cpp-side C++ work, not something
+to take on mid-investigation tonight.
+
+**Reverted node-a to the proven manual `com.caravan.llama-server` plist**
+(Tailscale IP, known to work fine under launchd) rather than leave it
+crash-looping or stuck on single-node. node-b's agent cutover is
+unaffected and stays live -- the tail role never tries to reach
+Thunderbolt itself, only the head does. Cleaned up all throwaway test
+plists/scripts (`/tmp/com.caravan.difftest.plist`,
+`com.caravan.spawntest.plist`, `com.caravan.directtest.plist` and their
+logs) -- nothing left behind.
