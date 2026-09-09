@@ -18,6 +18,13 @@ liveness check. One endpoint doing both rather than a second one,
 since anything polling for "is this peer alive" benefits from getting
 "and how loaded is it" in the same round trip for free.
 
+Also reports this node's own Thunderbolt fast-path address(es), if any
+(see discovery/thunderbolt.py) -- how a peer learns to try the direct
+wired link first instead of Tailscale/WiFi (see caravan_agent.py's
+_select_best_address). Same reasoning as stats: a peer already has to
+call /health to confirm liveness, so it gets this for free rather than
+needing a second round trip.
+
 2026-09-06: first real cross-node test (see docs/LOG.md) found this
 hanging for ~35s on startup on node-b specifically. Root cause:
 `http.server.HTTPServer.server_bind()` calls `socket.getfqdn(host)` to
@@ -35,6 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
 import system_stats
+from discovery import thunderbolt
 
 
 class _Server(ThreadingHTTPServer):
@@ -61,10 +69,15 @@ class _HealthHandler(BaseHTTPRequestHandler):
             stats = system_stats.gather([config.SLOT_SAVE_DIR, config.RPC_CACHE_DIR])
         except Exception as exc:  # noqa: BLE001 -- stats are a bonus, never fail liveness over them
             stats = {"error": str(exc)}
+        try:
+            fast_paths = thunderbolt.local_fast_paths()
+        except Exception:  # noqa: BLE001 -- same reasoning as stats above
+            fast_paths = []
         body = json.dumps({
             "status": "ok",
             "node_id": self.node_id,
             "stats": stats,
+            "fast_paths": fast_paths,
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

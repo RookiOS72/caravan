@@ -1539,3 +1539,61 @@ production. Left the benchmark llama-server process running rather than
 tearing it down mid-write-up; cleanup/restoration to be decided based on
 whether Caravan or exo should be openclaw's active primary right now,
 which is the other project's call, not this one's.
+
+## Auto-select fastest available network path
+
+User's proposal after seeing the Thunderbolt numbers: the agent should
+look for available network paths to a peer and automatically default to
+the fastest one, rather than a hardcoded IP. Built it as one feature
+covering both "use Thunderbolt when present" and "gracefully fall back
+if it isn't" (issue raised earlier tonight as a separate open question)
+-- they're the same mechanism, not two.
+
+**Design**: fixed priority by interface type (Thunderbolt > Tailscale >
+mDNS/LAN), not a live bandwidth measurement -- matches how the user
+described it, and reuses already-proven code instead of building new
+speed-testing infrastructure:
+
+- New `discovery/thunderbolt.py`: `local_fast_paths()` finds this node's
+  own IPv4 address on any *up* Thunderbolt Bridge interface, identified
+  via `networksetup -listallhardwareports`'s "Thunderbolt N" hardware
+  port labels (distinct from the "EXO Thunderbolt N" *service* names
+  exo's own earlier setup created -- different namespace, confirmed by
+  checking both outputs side by side rather than assuming they matched).
+- `health_server.py`'s `/health` now includes `fast_paths` alongside the
+  existing stats -- a peer already has to call `/health` to confirm
+  liveness, so it gets this for free in the same round trip.
+- `caravan_agent.py`: `is_agent_alive()` split into a lower-level
+  `_agent_health()` returning the full parsed body (peers need to read
+  `fast_paths`, not just get a bool). New `_select_best_address(peer)`
+  tries each of a peer's self-reported `fast_paths` in priority order,
+  reusing `is_agent_alive` (the same already-proven liveness check) as
+  the reachability test -- first one that answers wins, otherwise falls
+  back to whatever address `discover_peers` found the peer through
+  (Tailscale preferred over mDNS, as before). Wired into
+  `_rpc_addrs_from_peers` in place of the raw `peer['ip']` lookup.
+
+Automatic fallback falls out for free: if a peer's Thunderbolt candidate
+stops answering (cable unplugged, or never connected), `is_agent_alive`
+just returns False for it and the next candidate in priority order gets
+used -- no separate "detect disconnection" logic needed.
+
+**Verified both directions**, not just the happy path: started a
+disposable standalone `health_server` instance on node-b (its real
+`com.caravan.agent` isn't running right now -- only the manually-managed
+`rpc-server`, see above -- so this tested the new code without touching
+the live benchmark) and confirmed real dry-run output on node-a: with
+`fast_paths: ["169.254.72.237"]` reported, `discover_peers` found
+node-b via Tailscale as before but `_select_best_address` correctly
+substituted the Thunderbolt address for the actual `--rpc` target,
+producing the exact command tonight's manual benchmark used, now fully
+automatic. Then tested the fallback path directly with a synthetic peer
+carrying a deliberately unreachable fast_path (`169.254.99.99`,
+nothing listening there) and confirmed it correctly fell through to the
+Tailscale IP instead of failing. Cleaned up the disposable test process
+afterward.
+
+Not yet live-tested through a real `--apply` agent cutover (same
+caveat as the mDNS fallback work above) -- the logic is proven correct
+in isolation and via dry run, not yet proven under actual launchd
+supervision end to end.

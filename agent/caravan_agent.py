@@ -21,6 +21,7 @@ Usage:
 """
 import argparse
 import http.client
+import json
 import sys
 import time
 from pathlib import Path
@@ -33,25 +34,41 @@ import supervisor
 from discovery import mdns, tailscale
 
 
-def is_agent_alive(ip: str, timeout: float = 1.5) -> bool:
-    """True only if a Caravan agent's health endpoint actually answers at
-    `ip`:AGENT_PORT -- the gate that stops "some other machine happens to
+def _agent_health(ip: str, timeout: float = 1.5) -> dict | None:
+    """Full parsed /health response from `ip`:AGENT_PORT, or None if it
+    doesn't answer -- the gate that stops "some other machine happens to
     be reachable" from being trusted as a real tail. Without this,
     Tailscale discovery in particular will find every peer in the
     tailnet, Caravan or not -- confirmed directly: a dry run tonight
     found an unrelated tailnet machine (prf-hays-mgmt) and would have
     wired it into --rpc as if it were a tail. See health_server.py.
+
+    Returns the full body (not just True/False) so callers can read a
+    peer's self-reported `fast_paths` (Thunderbolt addresses -- see
+    discovery/thunderbolt.py) without a second round trip.
     """
     try:
         conn = http.client.HTTPConnection(ip, config.AGENT_PORT, timeout=timeout)
         conn.request("GET", "/health")
         resp = conn.getresponse()
-        ok = resp.status == 200
+        if resp.status != 200:
+            resp.read()
+            conn.close()
+            return None
+        body = json.loads(resp.read())
         conn.close()
-        return ok
-    except OSError as exc:
-        print(f"[caravan-agent] is_agent_alive({ip!r}) failed: {exc!r}")
-        return False
+        return body
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[caravan-agent] _agent_health({ip!r}) failed: {exc!r}")
+        return None
+
+
+def is_agent_alive(ip: str, timeout: float = 1.5) -> bool:
+    """True only if a Caravan agent's health endpoint actually answers.
+    Thin wrapper around _agent_health for call sites that just need the
+    liveness gate, not the response body (e.g. probing a candidate
+    fast-path address -- see _select_best_address)."""
+    return _agent_health(ip, timeout=timeout) is not None
 
 
 def discover_peers(agent_id: str, self_hostname: str | None = None) -> list[dict]:
@@ -87,22 +104,28 @@ def discover_peers(agent_id: str, self_hostname: str | None = None) -> list[dict
     peers = []
 
     for peer in tailscale.get_peers():
-        if not peer.online or not is_agent_alive(peer.tailscale_ip):
+        if not peer.online:
+            continue
+        health = _agent_health(peer.tailscale_ip)
+        if health is None:
             continue
         peers.append({
             "source": "tailscale",
             "hostname": peer.hostname,
             "ip": peer.tailscale_ip,
+            "fast_paths": health.get("fast_paths", []),
         })
 
     for peer in mdns.discover_peers():
         if self_hostname is not None and _normalize_hostname(peer.hostname) == _normalize_hostname(self_hostname):
             continue
-        if not is_agent_alive(peer.hostname):
+        health = _agent_health(peer.hostname)
+        if health is None:
             continue
         peers.append({
             "source": "mdns",
             "hostname": peer.hostname,
+            "fast_paths": health.get("fast_paths", []),
             "ip": peer.hostname,  # resolved hostname, not yet a bare IP
             "port": peer.port,
         })
@@ -121,12 +144,34 @@ def _normalize_hostname(hostname: str) -> str:
     return hostname.split(".")[0].lower()
 
 
+def _select_best_address(peer: dict) -> str:
+    """Picks the fastest reachable address for one peer: tries each of
+    its self-reported Thunderbolt fast_paths (see discovery/thunderbolt.py
+    and health_server.py) in order, falling back to whatever address
+    discover_peers found it through (Tailscale preferred there, mDNS
+    otherwise) if none of them answer.
+
+    Reachability, not speed, is what's tested -- interface type
+    (Thunderbolt > Tailscale > mDNS/LAN) is the whole ranking signal, no
+    bandwidth measurement. Reuses is_agent_alive (the same already-proven
+    liveness check used to validate the peer in the first place) against
+    each candidate's AGENT_PORT. This doubles as automatic fallback if a
+    Thunderbolt cable is ever unplugged: the candidate simply stops
+    answering and the next one in priority order gets used instead --
+    see docs/LOG.md, "auto-select fastest available network path", for
+    why this was built as one feature rather than two.
+    """
+    for candidate in peer.get("fast_paths", []):
+        if is_agent_alive(candidate):
+            return candidate
+    return peer["ip"]
+
+
 def _rpc_addrs_from_peers(peers: list[dict]) -> list[str]:
-    """Builds the --rpc address list, Tailscale preferred per
-    ARCHITECTURE.md, falling back to mDNS for any peer Tailscale didn't
-    find -- e.g. today's Tailscale-CLI-under-launchd failure (see
-    discover_peers's docstring), where Tailscale finds nothing at all and
-    mDNS is the only thing that makes sharding work. Always uses
+    """Builds the --rpc address list, Tailscale preferred over mDNS per
+    ARCHITECTURE.md when neither has a reachable Thunderbolt fast-path
+    (mDNS is the fallback for today's Tailscale-CLI-under-launchd
+    failure -- see discover_peers's docstring). Always uses
     config.RPC_PORT regardless of source; a peer dict's own "port" field
     (when present) is that peer's *agent* health port, not its RPC port.
     """
@@ -135,7 +180,7 @@ def _rpc_addrs_from_peers(peers: list[dict]) -> list[str]:
         key = _normalize_hostname(p["hostname"])
         if key not in by_node or p["source"] == "tailscale":
             by_node[key] = p
-    return [f"{p['ip']}:{config.RPC_PORT}" for p in by_node.values()]
+    return [f"{_select_best_address(p)}:{config.RPC_PORT}" for p in by_node.values()]
 
 
 def main() -> int:
